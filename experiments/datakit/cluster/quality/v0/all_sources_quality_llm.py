@@ -101,7 +101,12 @@ class LlmQualityOutput(BaseModel):
     counters: dict[str, int | float]
 
 
-def _register_model_step(name: str, model_bin_path: str, output_path_prefix: str | None = None) -> StepSpec:
+def _register_model_step(
+    name: str,
+    model_bin_path: str,
+    model_version: str | None = None,
+    output_path_prefix: str | None = None,
+) -> StepSpec:
     """Tiny StepSpec that just emits a FastTextModel artifact pointing at *model_bin_path*.
 
     :func:`classify_llm_quality_step` consumes its ``model_step`` via
@@ -109,6 +114,11 @@ def _register_model_step(name: str, model_bin_path: str, output_path_prefix: str
     whose ``.artifact`` is a :class:`FastTextModel`. The fn here doesn't
     stage anything -- the bin is already on GCS at the path produced by
     :mod:`llm_quality.train`. We just record provenance.
+
+    ``model_version`` is a caller-supplied identity tag: when given, it (not the
+    region-specific ``model_bin_path``) is what enters the step hash, so the same
+    model staged in two regions resolves to one output path. When ``None`` the
+    absolute path is hashed (legacy identity for this module's own fan-out).
     """
 
     def _fn(_output_path: str) -> FastTextModel:
@@ -123,7 +133,9 @@ def _register_model_step(name: str, model_bin_path: str, output_path_prefix: str
             size_bytes=size,
         )
 
-    hash_attrs: dict[str, Any] = {"model_path": model_bin_path}
+    hash_attrs: dict[str, Any] = (
+        {"model_version": model_version} if model_version is not None else {"model_path": model_bin_path}
+    )
     return StepSpec(
         name=name,
         fn=_fn,

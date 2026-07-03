@@ -54,9 +54,19 @@ def main() -> None:
         help="GCS path to a trained fasttext quality model.bin (cluster/quality/v0).",
     )
     parser.add_argument(
+        "--quality-model-version",
+        default="sonnet46-thr05",
+        help="Identity tag hashed in place of the model path (default matches the standard smoke model).",
+    )
+    parser.add_argument(
         "--domain-centroids",
         default=None,
         help="Optional pre-staged centroids dir. Omit to train K=64 centroids inline.",
+    )
+    parser.add_argument(
+        "--domain-centroids-version",
+        default=None,
+        help="Identity tag for --domain-centroids (required only when it is given).",
     )
     parser.add_argument(
         "--sources",
@@ -84,7 +94,9 @@ def main() -> None:
     result = reference_datakit_steps(
         select_sources(names),
         domain_centroids=args.domain_centroids,
+        centroids_version=args.domain_centroids_version,
         quality_model=args.quality_model,
+        quality_model_version=args.quality_model_version,
         scale=scale,
     )
     StepRunner().run(result.all_steps, max_concurrent=args.max_concurrent)

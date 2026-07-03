@@ -85,8 +85,8 @@ logger = logging.getLogger(__name__)
 # against these cutoffs, yielding 0..(len(thresholds)) inclusive. With the
 # default below: bucket 0 = [0, 0.2), 1 = [0.2, 0.4), 2 = [0.4, 0.6),
 # 3 = [0.6, 0.8), 4 = [0.8, 1.0].
-_QUALITY_THRESHOLDS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
-N_QUALITY_BUCKETS = len(_QUALITY_THRESHOLDS) + 1
+DEFAULT_QUALITY_THRESHOLDS: tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
+N_QUALITY_BUCKETS = len(DEFAULT_QUALITY_THRESHOLDS) + 1
 
 
 class BucketCacheStats(BaseModel):
@@ -326,9 +326,9 @@ _BATCH_FLUSH = 256
 _TOKENIZE_BATCH_SIZE = 8192
 
 
-def _quality_bucket(score: float) -> int:
-    """Map a fasttext ``score`` (float in [0, 1]) to a bucket index 0..N_QUALITY_BUCKETS-1."""
-    return bisect.bisect_right(_QUALITY_THRESHOLDS, score)
+def _quality_bucket(score: float, thresholds: tuple[float, ...]) -> int:
+    """Map a fasttext ``score`` (float in [0, 1]) to a bucket index 0..len(thresholds)."""
+    return bisect.bisect_right(thresholds, score)
 
 
 def _join_filter_stream_shard(
@@ -336,6 +336,7 @@ def _join_filter_stream_shard(
     shard_info: ShardInfo,
     *,
     cluster_col: str,
+    quality_thresholds: tuple[float, ...],
     output_path: str,
 ) -> Iterator[dict[str, int]]:
     """One TASK (batch of N input shards) -> up to K_clusters x K_quality Levanter shard caches.
@@ -473,7 +474,7 @@ def _join_filter_stream_shard(
                             n_dedup_dropped_total += 1
                             continue
                         # canonical True OR id missing from dedup (singleton) -> keep
-                        key = (int(cluster_slice[i]), _quality_bucket(quality_slice[i]))
+                        key = (int(cluster_slice[i]), _quality_bucket(quality_slice[i], quality_thresholds))
                         # ``.values.to_numpy()`` copies just this row's tokens
                         # into a fresh int32 buffer (~4 bytes/token vs ~28 for
                         # boxed Python ints), so the pyarrow batch can be GC'd
@@ -624,6 +625,7 @@ def build_clustered_store(
     dedup: FuzzyDupsAttrData,
     output_path: str,
     cluster_view: int = 40,
+    quality_thresholds: tuple[float, ...] = DEFAULT_QUALITY_THRESHOLDS,
     split: str = "train",
     worker_resources: ResourceConfig | None = None,
     max_workers: int = 4096,
@@ -674,7 +676,7 @@ def build_clustered_store(
             len(tokenize),
             cluster_view,
             cluster_col,
-            list(_QUALITY_THRESHOLDS),
+            list(quality_thresholds),
             split,
             output_path,
         )
@@ -737,8 +739,8 @@ def build_clustered_store(
             name="datakit-clustered-store",
         )
         ds = Dataset.from_list(batched_specs).map_shard(
-            lambda items, shard, cc=cluster_col, op=output_path: _join_filter_stream_shard(
-                items, shard, cluster_col=cc, output_path=op
+            lambda items, shard, cc=cluster_col, qt=quality_thresholds, op=output_path: _join_filter_stream_shard(
+                items, shard, cluster_col=cc, quality_thresholds=qt, output_path=op
             )
         )
         outcome = ctx.execute(ds, verbose=True)
@@ -774,7 +776,7 @@ def build_clustered_store(
     artifact = ClusteredStoreData(
         cache_path=output_path,
         cluster_view=cluster_view,
-        quality_thresholds=list(_QUALITY_THRESHOLDS),
+        quality_thresholds=list(quality_thresholds),
         split=split,
         buckets=buckets,
         source_names=sorted(tokenize),
