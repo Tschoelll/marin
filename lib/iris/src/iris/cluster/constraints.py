@@ -32,33 +32,16 @@ A job's region requirement has three distinct states:
   ``region EXISTS`` would otherwise exclude workers/groups that advertise no region).
 """
 
-from __future__ import annotations
-
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from enum import Enum, IntEnum, StrEnum
 from typing import Any, ClassVar
 
+from iris.cluster.config import ScaleGroupResources
 from iris.cluster.tpu_topology import TpuTopologyInfo, get_tpu_topology
-from iris.rpc import config_pb2, job_pb2
-
-
-class WellKnownAttribute(StrEnum):
-    """Canonical attribute keys for constraint-based scheduling."""
-
-    DEVICE_TYPE = "device-type"
-    DEVICE_VARIANT = "device-variant"
-    PREEMPTIBLE = "preemptible"
-    REGION = "region"
-    ZONE = "zone"
-    TPU_NAME = "tpu-name"
-    TPU_WORKER_ID = "tpu-worker-id"
-    TPU_TOPOLOGY = "tpu-topology"
-    TPU_VM_COUNT = "tpu-vm-count"
-    GPU_VARIANT = "gpu-variant"
-    GPU_COUNT = "gpu-count"
-
+from iris.cluster.types import AUTO_DEVICE_VARIANT, AcceleratorType, CapacityType, WellKnownAttribute
+from iris.rpc import job_pb2
 
 # ---------------------------------------------------------------------------
 # Step 1 types: core constraint primitives (depend only on job_pb2)
@@ -131,7 +114,7 @@ class AttributeValue:
         return proto
 
     @staticmethod
-    def from_proto(proto: job_pb2.AttributeValue) -> AttributeValue:
+    def from_proto(proto: job_pb2.AttributeValue) -> "AttributeValue":
         """Convert from protobuf representation."""
         if proto.HasField("string_value"):
             return AttributeValue(proto.string_value)
@@ -259,7 +242,7 @@ class Constraint:
         return proto
 
     @staticmethod
-    def from_proto(proto: job_pb2.Constraint) -> Constraint:
+    def from_proto(proto: job_pb2.Constraint) -> "Constraint":
         """Convert from protobuf representation.
 
         Normalization (strip/lowercase for strings) happens inside
@@ -284,7 +267,7 @@ class Constraint:
         value: str | int | float | None = None,
         values: Sequence[str | int | float] | None = None,
         mode: int = job_pb2.CONSTRAINT_MODE_REQUIRED,
-    ) -> Constraint:
+    ) -> "Constraint":
         """Ergonomic factory: wraps raw scalars in AttributeValue automatically.
 
         - Singular ops (EQ/NE/GT/GE/LT/LE): pass ``value=``.
@@ -371,28 +354,61 @@ def availability_constraint(variant: str) -> Constraint:
     )
 
 
-def availability_constraints_from_reservation(reservation: job_pb2.ReservationConfig) -> list[Constraint]:
-    """Map a deprecated ``ReservationConfig`` to hard ``availability:<variant>`` constraints.
+# ---------------------------------------------------------------------------
+# Federated availability: numeric "how much of a resource is free right now".
+#
+# Distinct from ``availability:<variant>`` above. That marker is BOOLEAN and
+# means "this accelerator has been empirically obtained in this zone" — a
+# feasibility signal. The ``available:<token>`` gate here is NUMERIC and means
+# "a federation peer has >= N of this resource free right now". The parent gates
+# a queued federated job on it (see federation.availability) so jobs wait for and
+# spread across peers with real idle capacity instead of piling onto the first.
+# ---------------------------------------------------------------------------
 
-    Back-compat shim for pre-availability clients (see job.proto): each reservation
-    entry's accelerator variant becomes one hard availability constraint. Entries
-    with no accelerator device contribute nothing (availability is accelerators
-    only). Deduplicated by key so duplicate entries collapse to a single constraint.
+AVAILABLE_PREFIX = "available:"
+
+
+def available_key(token: str) -> str:
+    """Composite attribute key naming a free-capacity resource token.
+
+    The numeric parallel of :func:`availability_key`: ``available:h100`` names the
+    count of free H100 chips a peer advertises. The token is lowercased to match the
+    canonical ``device-variant`` string (``available:v5p-8``, ``available:h100``).
     """
-    constraints: list[Constraint] = []
-    seen: set[str] = set()
-    for entry in reservation.entries:
-        if not entry.resources.HasField("device"):
-            continue
-        variant = get_device_variant(entry.resources.device)
-        if not variant or variant == "auto":
-            continue
-        key = availability_key(variant)
-        if key in seen:
-            continue
-        seen.add(key)
-        constraints.append(availability_constraint(variant))
-    return constraints
+    return f"{AVAILABLE_PREFIX}{token.strip().lower()}"
+
+
+def required_resource_amounts(device: job_pb2.DeviceConfig, replicas: int) -> dict[str, int]:
+    """Free-capacity amounts a whole job needs from a single peer backend, per token.
+
+    A federated root job runs entirely on one peer, so its requirement is the sum
+    over all its replicas. v1 gates on accelerator chips only:
+    ``{"h100": max(1, replicas) * per_replica_gpu_count}``. Returns an empty map for
+    CPU jobs, an ``auto`` variant (no concrete token to match), or TPU (peers do not
+    advertise TPU-slice availability in v1) — those carry no availability gate and
+    fall back to shape-only peer eligibility, exactly as today.
+    """
+    variant = get_device_variant(device)
+    if not variant or variant == AUTO_DEVICE_VARIANT:
+        return {}
+    if get_device_type_enum(device) != DeviceType.GPU:
+        return {}
+    per_replica = device.gpu.count or 1
+    return {variant.strip().lower(): max(1, replicas) * per_replica}
+
+
+def peer_availability_gate(device: job_pb2.DeviceConfig, replicas: int) -> list[Constraint]:
+    """The ``ge(available:<token>, amount)`` constraints a peer backend must satisfy to host the job.
+
+    One ``GE`` constraint per gated resource token, its threshold the whole job's
+    requirement (:func:`required_resource_amounts`). Empty for a job with no gated
+    resource (plain CPU/TPU). The threshold is evaluated against a backend's advertised
+    ``available:<token>`` amount like any other constraint (:func:`evaluate_constraint`).
+    """
+    return [
+        Constraint.create(key=available_key(token), op=ConstraintOp.GE, value=amount)
+        for token, amount in required_resource_amounts(device, replicas).items()
+    ]
 
 
 def region_constraint(regions: list[str]) -> Constraint:
@@ -788,7 +804,7 @@ def constraints_from_resources(resources: job_pb2.ResourceSpecProto) -> list[Con
         constraints.append(Constraint.create(key=WellKnownAttribute.DEVICE_TYPE, op=ConstraintOp.EQ, value=device_type))
 
     variant = get_device_variant(resources.device)
-    if variant and variant != "auto":
+    if variant and variant != AUTO_DEVICE_VARIANT:
         constraints.append(Constraint.create(key=WellKnownAttribute.DEVICE_VARIANT, op=ConstraintOp.EQ, value=variant))
 
     return constraints
@@ -823,7 +839,7 @@ def validate_tpu_request(
         return None
 
     primary = resources.device.tpu.variant
-    if not primary or primary == "auto":
+    if not primary or primary == AUTO_DEVICE_VARIANT:
         return None
 
     chips_requested = resources.device.tpu.count
@@ -925,17 +941,11 @@ def infer_preemptible_constraint(
     return None
 
 
-def accelerator_type_to_string(accel_type: int) -> str:
-    """Convert AcceleratorType proto enum value to a scheduling string."""
-    if accel_type == config_pb2.ACCELERATOR_TYPE_UNSPECIFIED:
+def accelerator_type_to_string(accel_type: AcceleratorType | None) -> str:
+    """Convert an AcceleratorType to a scheduling string (unset → "cpu")."""
+    if accel_type is None:
         return "cpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_CPU:
-        return "cpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_GPU:
-        return "gpu"
-    if accel_type == config_pb2.ACCELERATOR_TYPE_TPU:
-        return "tpu"
-    raise ValueError(f"Unknown accelerator type: {accel_type}")
+    return accel_type.value
 
 
 def _compare_ordered(
@@ -1023,6 +1033,55 @@ def is_any_region_marker(c: Constraint) -> bool:
     return c.key == WellKnownAttribute.REGION and c.op == ConstraintOp.EXISTS
 
 
+BACKEND_CONSTRAINT_KEY = "backend"
+"""Reserved constraint key carrying a ``--backend`` routing directive.
+
+A ``backend EQ <id>`` constraint pins a job to a named task backend. The
+meta-scheduler reads it via :func:`backend_directive` and strips it (no worker
+advertises a ``backend`` attribute, so a leftover hard ``backend=X`` constraint
+would match no worker and starve the task) before per-backend scheduling sees
+the constraints."""
+
+
+def strip_backend_constraints(constraints: Sequence[Constraint]) -> list[Constraint]:
+    """Drop the reserved ``backend`` routing directive from ``constraints``."""
+    return [c for c in constraints if c.key != BACKEND_CONSTRAINT_KEY]
+
+
+def backend_directive(constraints: Sequence[Constraint]) -> str | None:
+    """Return the ``--backend`` target from a ``backend EQ <id>`` constraint, if any."""
+    for c in constraints:
+        if c.key == BACKEND_CONSTRAINT_KEY and c.op == ConstraintOp.EQ:
+            return str(c.values[0].value)
+    return None
+
+
+CLUSTER_CONSTRAINT_KEY = "cluster"
+"""Reserved constraint key carrying a ``--cluster`` federation routing directive.
+
+A ``cluster EQ <peer>`` constraint pins a whole job to a named federation peer:
+the submit-time router hands it off to that peer instead of running it locally.
+Federation strips it before the handed-off request reaches the peer's worker
+matching (no worker advertises a ``cluster`` attribute, so a leftover hard
+``cluster=X`` constraint would match no worker and starve the task), exactly as
+the ``backend`` directive is stripped for local scheduling. A job may not pin
+both a local ``backend`` and a ``cluster`` — the two directives are mutually
+exclusive (one runs the job here, the other hands it off)."""
+
+
+def strip_cluster_constraints(constraints: Sequence[Constraint]) -> list[Constraint]:
+    """Drop the reserved ``cluster`` federation routing directive from ``constraints``."""
+    return [c for c in constraints if c.key != CLUSTER_CONSTRAINT_KEY]
+
+
+def cluster_directive(constraints: Sequence[Constraint]) -> str | None:
+    """Return the ``--cluster`` peer target from a ``cluster EQ <peer>`` constraint, if any."""
+    for c in constraints:
+        if c.key == CLUSTER_CONSTRAINT_KEY and c.op == ConstraintOp.EQ:
+            return str(c.values[0].value)
+    return None
+
+
 def routing_constraints(constraints: Sequence[Constraint]) -> list[Constraint]:
     """Filter to routing-only constraints, stripping CPU device-type.
 
@@ -1099,7 +1158,7 @@ class ConstraintIndex:
     _entity_attributes: dict[str, dict[str, AttributeValue]]
 
     @classmethod
-    def build(cls, entities: dict[str, dict[str, AttributeValue]]) -> ConstraintIndex:
+    def build(cls, entities: dict[str, dict[str, AttributeValue]]) -> "ConstraintIndex":
         """Build index from entity_id -> attributes mapping."""
         discrete_lists: dict[str, dict[str | int | float, set[str]]] = {}
         for entity_id, attrs in entities.items():
@@ -1229,7 +1288,7 @@ def check_resource_fit(
     return None
 
 
-def worker_attributes_from_resources(resources: config_pb2.ScaleGroupResources) -> dict[str, str]:
+def worker_attributes_from_resources(resources: ScaleGroupResources) -> dict[str, str]:
     """Derive well-known worker attributes from scale group resources config.
 
     This ensures local workers advertise the same device-type, device-variant,
@@ -1239,6 +1298,6 @@ def worker_attributes_from_resources(resources: config_pb2.ScaleGroupResources) 
     attrs[WellKnownAttribute.DEVICE_TYPE] = accelerator_type_to_string(resources.device_type)
     if resources.device_variant:
         attrs[WellKnownAttribute.DEVICE_VARIANT] = resources.device_variant.lower()
-    is_preemptible = resources.capacity_type == config_pb2.CAPACITY_TYPE_PREEMPTIBLE
+    is_preemptible = resources.capacity_type == CapacityType.PREEMPTIBLE
     attrs[WellKnownAttribute.PREEMPTIBLE] = str(is_preemptible).lower()
     return attrs

@@ -9,56 +9,17 @@ import threading
 from zephyr import counters
 from zephyr.counters import ScopedCounters
 from zephyr.execution import ZephyrCoordinator, ZephyrExecutionResult
+from zephyr.runners import _InProcessWorkerContext
 from zephyr.worker_context import Aggregation, CounterEntry, CounterSnapshot, _worker_ctx_var
 
 
-class FakeWorker:
-    """Minimal WorkerContext implementation for testing counters."""
+def _worker(stage_name: str = "test_stage") -> _InProcessWorkerContext:
+    """Real worker context so tests exercise the production counter-accumulation path.
 
-    def __init__(self, stage_name: str = "test_stage"):
-        self._counters: dict[str, CounterEntry] = {}
-        self._generation: int = 0
-        self._stage_name = stage_name
-
-    def get_shared(self, name: str):
-        raise NotImplementedError
-
-    def set_counter(self, name: str, value: int | float, stage: str | None = None) -> None:
-        if name in self._counters:
-            entry = self._counters[name]
-            entry.value = value
-            entry.count = 1
-            entry.stage = stage
-        else:
-            self._counters[name] = CounterEntry(value, stage=stage)
-
-    def update_counter(self, name: str, value: int | float, stage: str | None = None) -> None:
-        entry = self._counters.get(name)
-        if entry is None or entry.count == 0:
-            if entry is None:
-                self._counters[name] = CounterEntry(value, stage=stage)
-            else:
-                entry.value = value
-                entry.stage = stage
-                entry.count = 1
-            return
-        entry.merge(CounterEntry(value, entry.aggregation, stage, count=1))
-
-    def set_aggregation(self, name: str, agg: Aggregation) -> None:
-        if name in self._counters:
-            self._counters[name].aggregation = agg
-        else:
-            self._counters[name] = CounterEntry(0, aggregation=agg, count=0)
-
-    def current_stage_name(self) -> str:
-        return self._stage_name
-
-    def get_counter_snapshot(self) -> CounterSnapshot:
-        self._generation += 1
-        return CounterSnapshot(
-            counters={k: CounterEntry(e.value, e.aggregation, e.stage, e.count) for k, e in self._counters.items()},
-            generation=self._generation,
-        )
+    ``get_shared`` (the only method that touches storage) is never called by
+    counter tests, so the empty chunk/execution ids are inert.
+    """
+    return _InProcessWorkerContext(chunk_prefix="", execution_id="", stage_name=stage_name)
 
 
 def _make_coordinator(
@@ -73,43 +34,43 @@ def _make_coordinator(
     return coord
 
 
-def test_counters_increment_and_snapshot():
-    """increment() accumulates in-memory; get_counter_snapshot() returns current values."""
-    worker = FakeWorker()
+def test_counters_update_and_snapshot():
+    """update_counter() accumulates in-memory; pipeline.get_counters() returns current values."""
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
-        counters.increment("docs", 10)
-        counters.increment("docs", 5)
-        counters.increment("errors", 1)
+        counters.pipeline.update_counter("docs", 10)
+        counters.pipeline.update_counter("docs", 5)
+        counters.pipeline.update_counter("errors", 1)
 
-        snapshot = counters.get_counters()
+        snapshot = counters.pipeline.get_counters()
         assert snapshot == {"docs": 15, "errors": 1}
     finally:
         _worker_ctx_var.reset(token)
 
 
 def test_counters_noop_outside_worker():
-    """increment() is a no-op when not inside a Zephyr worker context."""
+    """update_counter() is a no-op when not inside a Zephyr worker context."""
     token = _worker_ctx_var.set(None)
     try:
-        counters.increment("anything", 999)  # should not raise
-        assert counters.get_counters() == {}
+        counters.pipeline.update_counter("anything", 999)  # should not raise
+        assert counters.pipeline.get_counters() == {}
     finally:
         _worker_ctx_var.reset(token)
 
 
 def test_counters_set_counter():
     """set_counter() overwrites the counter value rather than accumulating."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
-        counters.increment("visits", 5)
-        counters.set_counter("visits", 2)  # overwrites, not 5+2
-        assert counters.get_counters() == {"visits": 2}
+        counters.pipeline.update_counter("visits", 5)
+        counters.pipeline.set_counter("visits", 2)  # overwrites, not 5+2
+        assert counters.pipeline.get_counters() == {"visits": 2}
 
-        counters.set_counter("mem_bytes", 1024)
-        counters.set_counter("mem_bytes", 2048)  # replaces previous value
-        assert counters.get_counters()["mem_bytes"] == 2048
+        counters.pipeline.set_counter("mem_bytes", 1024)
+        counters.pipeline.set_counter("mem_bytes", 2048)  # replaces previous value
+        assert counters.pipeline.get_counters()["mem_bytes"] == 2048
     finally:
         _worker_ctx_var.reset(token)
 
@@ -118,8 +79,8 @@ def test_set_counter_noop_outside_worker():
     """set_counter() is a no-op when not inside a Zephyr worker context."""
     token = _worker_ctx_var.set(None)
     try:
-        counters.set_counter("anything", 999)  # should not raise
-        assert counters.get_counters() == {}
+        counters.pipeline.set_counter("anything", 999)  # should not raise
+        assert counters.pipeline.get_counters() == {}
     finally:
         _worker_ctx_var.reset(token)
 
@@ -138,23 +99,9 @@ def test_zephyr_execution_result_empty():
     assert result.counters == {}
 
 
-def test_legacy_aliases_delegate_to_pipeline():
-    """Module-level increment/set_counter/get_counters delegate to pipeline scope."""
-    worker = FakeWorker()
-    token = _worker_ctx_var.set(worker)
-    try:
-        counters.increment("x", 3)
-        counters.set_counter("y", 7)
-        result = counters.get_counters()
-        assert result == {"x": 3, "y": 7}
-        assert counters.pipeline.get_counters() == {"x": 3, "y": 7}
-    finally:
-        _worker_ctx_var.reset(token)
-
-
 def test_stage_scoped_counters():
     """Stage-scoped counters carry stage=<name> on the entry, not a key prefix."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         s = counters.stage("tokenize")
@@ -163,16 +110,16 @@ def test_stage_scoped_counters():
 
         assert s.get_counters() == {"tokens": 150}
 
-        # The underlying entry carries stage metadata, not a prefixed key
-        assert worker._counters["tokens"].stage == "tokenize"
-        assert worker._counters["tokens"].value == 150
+        # Scoping is by stage tag, not a key prefix: the same un-prefixed key is
+        # invisible from pipeline scope (stage=None).
+        assert counters.pipeline.get_counters() == {}
     finally:
         _worker_ctx_var.reset(token)
 
 
 def test_stage_scope_isolated_from_pipeline():
     """Stage and pipeline counters with the same name are stored under the same key but different stage."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.update_counter("metric", 1)
@@ -188,14 +135,17 @@ def test_stage_scope_isolated_from_pipeline():
 
 def test_current_stage_uses_worker_stage_name():
     """current_stage() returns a ScopedCounters for the worker's current stage."""
-    worker = FakeWorker(stage_name="my_stage")
+    worker = _worker(stage_name="my_stage")
     token = _worker_ctx_var.set(worker)
     try:
         cs = counters.current_stage()
         cs.update_counter("items", 5)
 
         assert cs.get_counters() == {"items": 5}
-        assert worker._counters["items"].stage == "my_stage"
+        # current_stage() resolved to the worker's stage, so the counter is
+        # scoped to "my_stage" and absent from pipeline scope.
+        assert counters.stage("my_stage").get_counters() == {"items": 5}
+        assert counters.pipeline.get_counters() == {}
     finally:
         _worker_ctx_var.reset(token)
 
@@ -273,13 +223,13 @@ def test_aggregation_mixed():
     assert coord.get_counters() == {"total": 30, "peak": 100}
 
 
-def test_aggregation_conflict_keeps_first_and_warns(caplog):
-    """Conflicting aggregations keep the first-seen mode and warn, never raising.
+def test_aggregation_conflict_drops_counter_and_warns(caplog):
+    """Conflicting aggregations drop the counter and warn, never raising.
 
     Stats collection must not be able to fault the execution path, so a counter
     that disagrees on aggregation across snapshots (only possible via user
-    ``set_aggregation`` misuse) resolves to the first-seen mode rather than
-    raising.
+    ``set_aggregation`` misuse) is omitted from the result rather than
+    producing a semantically wrong value or raising.
     """
     coord = _make_coordinator(
         [
@@ -289,8 +239,8 @@ def test_aggregation_conflict_keeps_first_and_warns(caplog):
     )
     with caplog.at_level(logging.WARNING):
         result = coord.get_counters()
-    # First-seen aggregation (MAX) wins over the later MIN.
-    assert result == {"x": 2}
+    # Conflicting aggregations (MAX vs MIN) — drop x to avoid garbage.
+    assert "x" not in result
     assert any("conflicting aggregations" in r.message for r in caplog.records)
 
 
@@ -335,7 +285,7 @@ def test_coordinator_stage_filter_aggregates_same_name_across_stages():
 
 def test_update_counter_sum():
     """update_counter with SUM aggregation behaves like increment."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("hits", Aggregation.SUM)
@@ -348,7 +298,7 @@ def test_update_counter_sum():
 
 def test_update_counter_max():
     """update_counter with MAX keeps the running maximum."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("peak", Aggregation.MAX)
@@ -362,7 +312,7 @@ def test_update_counter_max():
 
 def test_update_counter_min():
     """update_counter with MIN keeps the running minimum."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("latency", Aggregation.MIN)
@@ -376,7 +326,7 @@ def test_update_counter_min():
 
 def test_update_counter_average():
     """update_counter with AVERAGE maintains a rolling average."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("cpu_pct", Aggregation.AVERAGE)
@@ -390,7 +340,7 @@ def test_update_counter_average():
 
 def test_update_counter_first_call_initialises():
     """First update_counter call on a new key sets value regardless of aggregation."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("x", Aggregation.MAX)
@@ -412,7 +362,7 @@ def test_update_counter_noop_outside_worker():
 
 def test_set_counter_resets_average_count():
     """set_counter resets the rolling-average count so subsequent update_counters start fresh."""
-    worker = FakeWorker()
+    worker = _worker()
     token = _worker_ctx_var.set(worker)
     try:
         counters.pipeline.set_aggregation("avg", Aggregation.AVERAGE)

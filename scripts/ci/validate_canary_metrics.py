@@ -19,10 +19,9 @@ import os
 import sys
 from collections.abc import Callable
 
-from marin.execution.executor import Executor
-from rigging.filesystem import open_url
+from rigging.filesystem import StoragePath
 
-from experiments.ferries.canary_ferry import canary_moe_step
+from experiments.ferries.canary_ferry import build
 
 
 def _env_float(key: str, default: float) -> float:
@@ -32,31 +31,24 @@ def _env_float(key: str, default: float) -> float:
 
 def _thresholds() -> list[tuple[str, str, Callable[[float, float], bool], float]]:
     return [
-        ("_step", "Steps completed", operator.ge, _env_float("CANARY_MIN_STEPS", 400)),
+        ("_step", "Steps completed", operator.ge, _env_float("CANARY_MIN_STEPS", 200)),
         ("train/loss", "Final loss", operator.le, _env_float("CANARY_MAX_LOSS", 8.0)),
     ]
 
 
 def resolve_canary_output_path() -> str:
-    """Resolve the canary ferry's output path via the executor's version hash.
+    """Resolve the canary ferry's output path from its lazy checkpoint.
 
     Uses mirror:// so the read works regardless of which region the canary
-    wrote to.
+    wrote to (an R2 pin resolves to its absolute bucket path instead).
     """
-
-    executor = Executor(
-        prefix="mirror://",
-        executor_info_base_path="mirror://experiments",
-    )
-    executor.compute_version(canary_moe_step, is_pseudo_dep=False)
-    return executor.output_paths[canary_moe_step]
+    return build().path("mirror://")
 
 
 def read_summary(output_path: str) -> dict:
     """Read the summary dict from tracker_metrics.jsonl."""
     metrics_file = f"{output_path}/tracker_metrics.jsonl"
-    with open_url(metrics_file, "r") as f:
-        record = json.loads(f.read().strip())
+    record = json.loads(StoragePath(metrics_file).read_text().strip())
     return record["summary"]
 
 

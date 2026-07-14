@@ -1,8 +1,6 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-from __future__ import annotations
-
 import dataclasses
 import functools
 import logging
@@ -35,14 +33,15 @@ from levanter.analysis.backward_flow import (
 )
 from levanter.callbacks.state_adapter import StateCallbackRunner
 from levanter.callbacks.watch import WatchConfig, compute_watch_stats
-from levanter.data import AsyncDataset, DataLoader
+from levanter.data.dataset import AsyncDataset
+from levanter.data.loader import DataLoader
 from levanter.data.mixture import MixtureDataset, rescale_mixture_schedule_for_batch_schedule
-from levanter.data.text import GrugLmExample, LmDataConfig
-from levanter.data.text.examples import grug_lm_example_from_named
+from levanter.data.text.datasets import LmDataConfig
+from levanter.data.text.examples import GrugLmExample, grug_lm_example_from_named
 from levanter.eval import TaggedEvaluator, cb_tagged_evaluate
 from levanter.grug.sharding import compact_grug_mesh
 from levanter.models.lm_model import LmExample
-from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.schedule import BatchSchedule
 from levanter.trainer import TrainerConfig
 from levanter.utils.flop_utils import lm_flops_per_token
@@ -52,6 +51,7 @@ from levanter.utils.logging import LoadingTimeTrackerIterator
 from experiments.grug.base.model import GrugModelConfig, Transformer
 from experiments.grug.checkpointing import restore_grug_state_from_checkpoint
 from experiments.grug.dispatch import dispatch_grug_training_run
+from experiments.grug.sharding_dump import dump_grug_state_sharding_run_artifact
 
 logger = logging.getLogger(__name__)
 _BACKWARD_FLOW_METRICS_KEY = "_backward_flow"
@@ -72,6 +72,7 @@ class GrugTrainerConfig:
         default_factory=lambda: BackwardFlowConfig(interval=_BACKWARD_FLOW_DEFAULT_INTERVAL)
     )
     loss_implementation: str | tuple[str, ...] | None = None
+    sharding_dump_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -480,6 +481,12 @@ def _run_grug_local(config: GrugRunConfig) -> None:
             load_checkpoint_setting=trainer.load_checkpoint,
             mesh=mesh,
             allow_partial=trainer.allow_partial_checkpoint,
+        )
+        dump_grug_state_sharding_run_artifact(
+            state,
+            log_dir=trainer.log_dir,
+            run_id=run_id,
+            path_override=config.trainer.sharding_dump_path,
         )
 
         levanter.tracker.log_summary({"parameter_count": parameter_count(state.params)})

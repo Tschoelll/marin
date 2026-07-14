@@ -11,18 +11,10 @@ proper job hierarchy, cascading cleanup, and region inheritance.
 import dataclasses
 import logging
 
-from fray import (
-    Client,
-    Entrypoint,
-    JobHandle,
-    JobRequest,
-    JobStatus,
-    ResourceConfig,
-    create_environment,
-    current_client,
-    wait_all,
-)
 from fray.actor import HostedActor
+from fray.client import Client, JobHandle, wait_all
+from fray.current_client import current_client
+from fray.types import Entrypoint, JobRequest, JobStatus, ResourceConfig, create_environment
 from marin.rl.curriculum import Curriculum
 from marin.rl.job_config import RLJobConfig, build_worker_configs
 from marin.rl.placement import resolve_launcher_region, singleton_region_list
@@ -194,6 +186,7 @@ def _run_rl_coordinator(config: RLJobConfig) -> None:
                 environment=train_worker_env,
                 max_retries_failure=run_config.max_retries_failure,
                 max_retries_preemption=run_config.max_retries_preemption,
+                max_task_failures=run_config.max_retries_failure,
             )
         )
         rollout_jobs: list[JobHandle] = []
@@ -220,6 +213,7 @@ def _run_rl_coordinator(config: RLJobConfig) -> None:
                         environment=rollout_worker_env,
                         max_retries_failure=run_config.max_retries_failure,
                         max_retries_preemption=run_config.max_retries_preemption,
+                        max_task_failures=run_config.max_retries_failure,
                     )
                 )
             )

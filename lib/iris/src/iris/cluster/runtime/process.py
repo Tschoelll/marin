@@ -14,8 +14,6 @@ Lifecycle management includes:
 - Process group termination on Unix platforms
 """
 
-from __future__ import annotations
-
 import atexit
 import logging
 import os
@@ -33,6 +31,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from iris.cluster.bundle import BundleStore
+from iris.cluster.log_keys import STDERR_SOURCE, STDOUT_SOURCE
 from iris.cluster.runtime.env import write_workdir_files
 from iris.cluster.runtime.profile import (
     LocalProfileDispatch,
@@ -65,7 +64,7 @@ logger = logging.getLogger(__name__)
 # Python interpreter shuts down (normal exit, sys.exit, unhandled exceptions).
 # This does NOT cover SIGKILL of the parent.
 
-_active_runtimes: weakref.WeakSet[ProcessRuntime] = weakref.WeakSet()
+_active_runtimes: "weakref.WeakSet[ProcessRuntime]" = weakref.WeakSet()
 
 
 def _cleanup_all_runtimes() -> None:
@@ -197,13 +196,13 @@ class ProcessContainer:
                 for stream in ready:
                     line = stream.readline()
                     if line:
-                        emit("stdout" if stream is stdout else "stderr", line)
+                        emit(STDOUT_SOURCE if stream is stdout else STDERR_SOURCE, line)
 
             # Process exited - drain remaining output
             for line in stdout:
-                emit("stdout", line)
+                emit(STDOUT_SOURCE, line)
             for line in stderr:
-                emit("stderr", line)
+                emit(STDERR_SOURCE, line)
 
             self._exit_code = self._process.returncode
             self._running = False
@@ -389,7 +388,7 @@ class ProcessContainerHandle:
     """
 
     config: ContainerConfig
-    runtime: ProcessRuntime
+    runtime: "ProcessRuntime"
     _container: ProcessContainer | None = field(default=None, repr=False)
     _container_id: str | None = field(default=None, repr=False)
     _prev_cpu_total: float = field(default=0.0, repr=False)
@@ -597,10 +596,6 @@ class ProcessRuntime:
         if bundle_id:
             bundle_store.extract_bundle_to(bundle_id, workdir)
         write_workdir_files(workdir, workdir_files)
-
-    def list_containers(self) -> list[ProcessContainerHandle]:
-        """List all managed container handles."""
-        return list(self._handles)
 
     def list_iris_containers(self, all_states: bool = True) -> list[str]:
         """List all container IDs."""

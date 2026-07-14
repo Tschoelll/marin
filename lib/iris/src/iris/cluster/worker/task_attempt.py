@@ -10,6 +10,7 @@ bundle download -> image build -> container run -> monitor -> cleanup.
 import contextlib
 import logging
 import shutil
+import signal
 import subprocess
 import threading
 import time
@@ -19,15 +20,13 @@ from pathlib import Path
 
 from finelog.client import LogClient, Table
 from finelog.rpc import logging_pb2
-from finelog.types import str_to_log_level
-from rigging.log_setup import parse_log_level
 from rigging.timing import Duration, ExponentialBackoff, Timestamp
 
 from iris.chaos import chaos, chaos_raise
-from iris.cluster.backends.types import probe_outbound_ip
 from iris.cluster.bundle import BundleStore
 from iris.cluster.constraints import WellKnownAttribute
-from iris.cluster.log_keys import task_log_key
+from iris.cluster.log_keys import INJECTED_ERROR_SOURCE, STDERR_SOURCE, classify_log_level, task_log_key
+from iris.cluster.platforms.types import probe_outbound_ip
 from iris.cluster.runtime.docker import DockerContainerHandle
 from iris.cluster.runtime.env import build_common_iris_env
 from iris.cluster.runtime.types import (
@@ -51,6 +50,7 @@ from iris.cluster.worker.worker_types import LogLine
 from iris.rpc import job_pb2, worker_pb2
 from iris.rpc.errors import format_exception_with_traceback
 from iris.rpc.job_pb2 import TaskState, WorkerMetadata
+from iris.rpc.proto_display import signal_name
 from iris.time_proto import timestamp_to_proto
 
 logger = logging.getLogger(__name__)
@@ -58,14 +58,6 @@ logger = logging.getLogger(__name__)
 # Trailing stderr lines scanned for TPU bad-node signatures on non-zero exit.
 _TPU_STDERR_TAIL_LINES = 200
 
-
-# Signal numbers for interpreting exit codes > 128
-_SIGNAL_NAMES = {
-    6: "SIGABRT",
-    9: "SIGKILL",
-    11: "SIGSEGV",
-    15: "SIGTERM",
-}
 
 # Max time to wait for the container to actually exit after force-kill before
 # reporting TASK_STATE_KILLED. SIGKILL is uncatchable, so a healthy runtime
@@ -97,11 +89,11 @@ def _format_exit_error(exit_code: int | None, oom_killed: bool = False) -> str:
     # Interpret signal-based exit codes
     if exit_code > 128:
         signal_num = exit_code - 128
-        signal_name = _SIGNAL_NAMES.get(signal_num, f"signal {signal_num}")
+        name = signal_name(signal_num)
         # Exit 137 (SIGKILL) without OOMKilled flag could still be resource-related
-        if signal_num == 9:
-            return f"Exit code {exit_code}: killed by {signal_name} (possibly OOM or resource limit)"
-        return f"Exit code {exit_code}: killed by {signal_name}"
+        if signal_num == signal.SIGKILL:
+            return f"Exit code {exit_code}: killed by {name} (possibly OOM or resource limit)"
+        return f"Exit code {exit_code}: killed by {name}"
 
     return f"Exit code: {exit_code}"
 
@@ -352,6 +344,10 @@ class TaskAttempt:
         instance.started_at = Timestamp.now()
         instance.status_message = "adopted"
         instance.workdir = Path(discovered.workdir_host_path) if discovered.workdir_host_path else None
+        # Restore host-port reservations and re-mark them taken so the worker
+        # never re-allocates an in-use port to a new task after restart.
+        instance.ports = dict(discovered.ports)
+        port_allocator.reserve(list(discovered.ports.values()))
         return instance
 
     def resume_monitoring(self) -> None:
@@ -375,7 +371,7 @@ class TaskAttempt:
             self._monitor_loop(handle, log_reader)
         except Exception as e:
             error_msg = format_exception_with_traceback(e)
-            self._append_log(source="error", data=f"Monitoring failed:\n{error_msg}")
+            self._append_log(source=INJECTED_ERROR_SOURCE, data=f"Monitoring failed:\n{error_msg}")
             self.transition_to(job_pb2.TASK_STATE_FAILED, error=error_msg)
         finally:
             self._cleanup()
@@ -632,11 +628,11 @@ class TaskAttempt:
             self.transition_to(job_pb2.TASK_STATE_KILLED)
         except ContainerInfraError as e:
             error_msg = format_exception_with_traceback(e)
-            self._append_log(source="error", data=f"Infrastructure error:\n{error_msg}")
+            self._append_log(source=INJECTED_ERROR_SOURCE, data=f"Infrastructure error:\n{error_msg}")
             self.transition_to(job_pb2.TASK_STATE_WORKER_FAILED, error=error_msg)
         except Exception as e:
             error_msg = format_exception_with_traceback(e)
-            self._append_log(source="error", data=f"Task failed:\n{error_msg}")
+            self._append_log(source=INJECTED_ERROR_SOURCE, data=f"Task failed:\n{error_msg}")
             self.transition_to(job_pb2.TASK_STATE_FAILED, error=error_msg)
         finally:
             self._cleanup()
@@ -759,6 +755,7 @@ class TaskAttempt:
             entrypoint=rt_ep,
             env=env,
             resources=self.request.resources if self.request.HasField("resources") else None,
+            container_profile=self.request.container_profile,
             timeout_seconds=timeout_seconds,
             mounts=mounts,
             workdir_host_path=self.workdir,
@@ -768,6 +765,7 @@ class TaskAttempt:
             job_id=job_id.to_wire(),
             worker_id=self._worker_id,
             worker_metadata=self._worker_metadata,
+            ports=self.ports,
         )
 
         chaos_raise("worker.create_container")
@@ -891,14 +889,14 @@ class TaskAttempt:
                     self.transition_to(job_pb2.TASK_STATE_SUCCEEDED, exit_code=0)
                 else:
                     stderr_tail: list[str] = [
-                        entry.data for entry in log_reader.read_all() if entry.source == "stderr" and entry.data
+                        entry.data for entry in log_reader.read_all() if entry.source == STDERR_SOURCE and entry.data
                     ]
                     stderr_line = stderr_tail[-1] if stderr_tail else None
                     error = _format_exit_error(status.exit_code, status.oom_killed)
                     if stderr_line:
                         error = f"{error}. stderr: {stderr_line}"
                     if status.oom_killed:
-                        self._append_log(source="error", data="Container was OOM killed by the kernel")
+                        self._append_log(source=INJECTED_ERROR_SOURCE, data="Container was OOM killed by the kernel")
                     # Promote known TPU bad-node signatures to WORKER_FAILED.
                     tpu_pattern = detect_tpu_init_failure(stderr_tail[-_TPU_STDERR_TAIL_LINES:])
                     if tpu_pattern is not None:
@@ -908,7 +906,7 @@ class TaskAttempt:
                             tpu_pattern,
                         )
                         self._append_log(
-                            source="error",
+                            source=INJECTED_ERROR_SOURCE,
                             data=f"iris: TPU bad-node signature detected ({tpu_pattern!r}); "
                             "reporting as worker failure",
                         )
@@ -952,10 +950,8 @@ class TaskAttempt:
             time.sleep(self._poll_interval_seconds)
 
     def _make_log_entry(self, *, source: str, data: str) -> logging_pb2.LogEntry:
-        """Build a LogEntry proto from a source/data pair, parsing the level prefix."""
-        level_name = parse_log_level(data)
-        level = str_to_log_level(level_name)
-        entry = logging_pb2.LogEntry(source=source, data=data, level=level)
+        """Build a LogEntry proto from a source/data pair, classifying its level."""
+        entry = logging_pb2.LogEntry(source=source, data=data, level=classify_log_level(source, data))
         entry.timestamp.epoch_ms = Timestamp.now().epoch_ms()
         return entry
 

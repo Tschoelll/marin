@@ -1,10 +1,8 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import dataclasses
 import json
 import logging
-import os
 
 import jmp
 import levanter
@@ -12,7 +10,9 @@ import levanter.eval_harness as eval_harness
 from levanter.compat.hf_checkpoints import HFCheckpointConverter
 from levanter.tracker.wandb import WandbConfig
 from levanter.trainer import TrainerConfig
+from levanter.utils.py_utils import FailSafeJSONEncoder
 from rigging.filesystem import filesystem as marin_filesystem
+from rigging.filesystem import prefix_join
 
 from marin.evaluation.evaluation_config import EvalTaskConfig, convert_to_levanter_task_config
 from marin.evaluation.evaluators.evaluator import Evaluator, ModelConfig
@@ -89,32 +89,15 @@ class LevanterLmEvalEvaluator(Evaluator):
 
         # Upload is best-effort: a transient GCS failure should not throw away an
         # otherwise successful (and very expensive) eval run.
-        results_path = os.path.join(output_path, "results.json")
+        results_path = prefix_join(output_path, "results.json")
         logger.info(f"Uploading results to GCS: {results_path}")
         try:
             fs = marin_filesystem("gcs")
             with fs.open(results_path, "w") as f:
-                json.dump(results, f, indent=2, default=_json_default)
+                # Same encoder Levanter uses to serialize this ``outputs`` object, so the
+                # uploaded results.json matches Levanter's own eval artifact.
+                json.dump(results, f, indent=2, cls=FailSafeJSONEncoder)
             levanter.tracker.current_tracker().finish()
             logger.info("Upload completed successfully.")
         except Exception:
             logger.warning("Failed to upload results to GCS: %s", results_path, exc_info=True)
-
-
-def _json_default(value):
-    """
-    Provide a best-effort JSON serialization for objects returned by the eval harness.
-    """
-    if dataclasses.is_dataclass(value):
-        return dataclasses.asdict(value)
-
-    if isinstance(value, set):
-        return list(value)
-
-    if hasattr(value, "to_dict") and callable(value.to_dict):
-        try:
-            return value.to_dict()
-        except Exception:
-            pass
-
-    return repr(value)

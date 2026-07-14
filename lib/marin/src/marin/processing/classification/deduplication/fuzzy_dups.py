@@ -31,23 +31,25 @@ global dedup: re-running this job over the union of all per-dataset MinHash
 artifacts produces fresh markers without re-reading any source text.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 from collections.abc import Iterator
 from typing import Any
 
-from fray import ResourceConfig
+from fray.types import ResourceConfig
 from pydantic import BaseModel
-from zephyr import Dataset, ZephyrContext, counters, write_parquet_file, zephyr_worker_ctx
+from rigging.filesystem import StoragePath
+from zephyr import counters
+from zephyr.dataset import Dataset
+from zephyr.execution import MAX_WORKERS_PER_JOB, ZephyrContext
+from zephyr.worker_context import zephyr_worker_ctx
+from zephyr.writers import write_parquet_file
 
-from marin.execution.artifact import Artifact
+from marin.execution.artifact import read_artifact
 from marin.execution.step_spec import StepSpec
 from marin.processing.classification.deduplication.connected_components import connected_components
 from marin.processing.classification.deduplication.dedup_commons import _load_batches
 from marin.processing.classification.deduplication.fuzzy_minhash import MinHashAttrData, MinHashParams
-from marin.utils import fsspec_glob
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +83,7 @@ class FuzzyDupsAttrData(BaseModel):
     version: str = "v1"
     params: MinHashParams
     sources: dict[str, FuzzyDupsPerSource]
-    counters: dict[str, int]
+    counters: dict[str, int | float]
 
 
 def _validate_inputs(inputs: list[MinHashAttrData]) -> MinHashParams:
@@ -128,7 +130,7 @@ def _build_shard_index(inputs: list[MinHashAttrData]) -> tuple[list[dict[str, An
 
     entries: list[dict[str, Any]] = []
     for m in inputs:
-        attr_shards = sorted(fsspec_glob(f"{m.attr_dir.rstrip('/')}/*.parquet"))
+        attr_shards = sorted(str(shard) for shard in StoragePath(f"{m.attr_dir.rstrip('/')}/*.parquet").glob())
         if not attr_shards:
             raise FileNotFoundError(f"No attr parquet shards under {m.attr_dir}")
         for attr_path in attr_shards:
@@ -215,13 +217,13 @@ def _make_per_shard_writer(output_path: str, counter_prefix: str):
             nonlocal cluster_members, canonicals
             for record in records:
                 if record["is_singleton"]:
-                    counters.increment(f"{counter_prefix}/singletons_skipped")
+                    counters.pipeline.update_counter(f"{counter_prefix}/singletons_skipped", 1)
                     continue
                 cluster_members += 1
-                counters.increment(f"{counter_prefix}/cluster_members")
+                counters.pipeline.update_counter(f"{counter_prefix}/cluster_members", 1)
                 if record["is_canonical"]:
                     canonicals += 1
-                    counters.increment(f"{counter_prefix}/canonicals")
+                    counters.pipeline.update_counter(f"{counter_prefix}/canonicals", 1)
                 yield {
                     "id": record["id"],
                     "attributes": {
@@ -248,10 +250,11 @@ def compute_fuzzy_dups_attrs(
     output_path: str,
     cc_max_iterations: int = 10,
     cc_resume: bool = False,
-    max_parallelism: int,
+    max_parallelism: int = MAX_WORKERS_PER_JOB,
     worker_resources: ResourceConfig | None = None,
     coordinator_resources: ResourceConfig | None = None,
-    map_workers_per_actor: int | None = None,
+    map_task_resources: ResourceConfig | None = None,
+    reduce_task_resources: ResourceConfig | None = None,
 ) -> FuzzyDupsAttrData:
     """Mark fuzzy-duplicate cluster membership across one or more ``MinHashAttrData`` inputs.
 
@@ -274,8 +277,12 @@ def compute_fuzzy_dups_attrs(
             ``<output_path>/outputs/source_NNN/``.
         cc_max_iterations: Max iterations for connected components.
         max_parallelism: Worker count for the ZephyrContext.
-        worker_resources: Per-worker resource request.
+        worker_resources: Per-worker resource request. Required when
+            ``map_task_resources`` is set.
         coordinator_resources: Coordinator resource request.
+        map_task_resources: ResourceConfig for map-stage tasks.
+        reduce_task_resources: ResourceConfig for reduce-stage tasks (e.g.
+            the per-shard ``group_by`` writer).
 
     Returns:
         :class:`FuzzyDupsAttrData` describing per-source attr directories,
@@ -303,8 +310,10 @@ def compute_fuzzy_dups_attrs(
     }
     if coordinator_resources is not None:
         ctx_kwargs["coordinator_resources"] = coordinator_resources
-    if map_workers_per_actor is not None:
-        ctx_kwargs["map_workers_per_actor"] = map_workers_per_actor
+    if map_task_resources is not None:
+        ctx_kwargs["map_task_resources"] = map_task_resources
+    if reduce_task_resources is not None:
+        ctx_kwargs["reduce_task_resources"] = reduce_task_resources
     ctx = ZephyrContext(**ctx_kwargs)
 
     # Cap shard count at max_parallelism. Each group reads its attr files
@@ -392,7 +401,7 @@ def compute_fuzzy_dups_attrs_step(
         name=name,
         deps=list(minhash_steps),
         fn=lambda output_path: compute_fuzzy_dups_attrs(
-            inputs=[Artifact.from_path(s, MinHashAttrData) for s in minhash_steps],
+            inputs=[read_artifact(s.output_path, MinHashAttrData) for s in minhash_steps],
             output_path=output_path,
             cc_max_iterations=cc_max_iterations,
             max_parallelism=max_parallelism,

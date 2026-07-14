@@ -8,8 +8,8 @@ Supports both an interactive curses TUI and non-interactive CLI commands
 for listing, viewing, and copying files.
 
 Usage:
-    export R2_ACCESS_KEY_ID=<your-key-id>
-    export R2_SECRET_ACCESS_KEY=<your-key-secret>
+    export CW_KEY_ID=<your-key-id>
+    export CW_KEY_SECRET=<your-key-secret>
 
     # Interactive TUI (default)
     uv run lib/iris/scripts/fs-browser.py [prefix]
@@ -33,7 +33,7 @@ import s3fs
 import yaml
 from tabulate import tabulate
 
-DEFAULT_CONFIG = str(pathlib.Path(__file__).parent.parent / "config" / "coreweave.yaml")
+DEFAULT_CONFIG = str(pathlib.Path(__file__).parent.parent / "config" / "cw-us-east-02a.yaml")
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB — refuse to download files larger than this
 
@@ -53,10 +53,16 @@ class Entry:
 
 
 def load_s3_config(config_path: str) -> S3Config:
-    """Load S3 endpoint and bucket from an Iris YAML config file."""
+    """Load S3 endpoint and bucket from an Iris YAML config file.
+
+    This browser runs on an operator's machine, so it takes the cluster's
+    externally reachable endpoint; ``object_storage_endpoint`` may name an address
+    only a pod can resolve.
+    """
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
-    endpoint = cfg["platform"]["coreweave"]["object_storage_endpoint"]
+    coreweave = cfg["platform"]["coreweave"]
+    endpoint = coreweave.get("external_object_storage_endpoint") or coreweave["object_storage_endpoint"]
     # Derive the bucket from the remote state dir (e.g. s3://marin-test/iris/state -> marin-test)
     remote_state_dir = cfg["storage"]["remote_state_dir"]
     bucket = remote_state_dir.removeprefix("s3://").split("/")[0]
@@ -72,10 +78,10 @@ def normalize_path(arg: str, bucket: str) -> str:
 
 
 def connect(s3_config: S3Config) -> s3fs.S3FileSystem:
-    key_id = os.environ.get("R2_ACCESS_KEY_ID")
-    key_secret = os.environ.get("R2_SECRET_ACCESS_KEY")
+    key_id = os.environ.get("CW_KEY_ID")
+    key_secret = os.environ.get("CW_KEY_SECRET")
     if not key_id or not key_secret:
-        print("ERROR: R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY must be set", file=sys.stderr)
+        print("ERROR: CW_KEY_ID and CW_KEY_SECRET must be set", file=sys.stderr)
         sys.exit(1)
 
     return s3fs.S3FileSystem(

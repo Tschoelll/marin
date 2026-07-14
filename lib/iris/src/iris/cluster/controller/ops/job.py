@@ -3,13 +3,11 @@
 
 """Aggregate-scoped commands for jobs: submit, cancel, remove_finished."""
 
-import logging
+from dataclasses import dataclass
 
 from rigging.timing import Timestamp
 from sqlalchemy import Integer, bindparam, cast, func, insert, select
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
-from iris.cluster.constraints import availability_constraints_from_reservation
 from iris.cluster.controller import reads, writes
 from iris.cluster.controller.audit_logging import log_event
 from iris.cluster.controller.codec import (
@@ -19,53 +17,20 @@ from iris.cluster.controller.codec import (
 )
 from iris.cluster.controller.db import Tx
 from iris.cluster.controller.projections.endpoints import EndpointsProjection
+from iris.cluster.controller.projections.run_templates import RunTemplatesProjection
 from iris.cluster.controller.reconcile import ReconcileState
 from iris.cluster.controller.reconcile.commit import commit_effects
 from iris.cluster.controller.reconcile.loader import load_closed_snapshot
 from iris.cluster.controller.reconcile.policy import (
     MAX_REPLICAS_PER_JOB,
 )
-from iris.cluster.controller.run_template import RunTemplateCache
 from iris.cluster.controller.schema import (
     job_workdir_files_table,
     jobs_table,
-    users_table,
 )
-from iris.cluster.types import TERMINAL_JOB_STATES, JobName
+from iris.cluster.types import LOCAL_ADMIN_SUBMITTER, LOCAL_CLUSTER, TERMINAL_JOB_STATES, JobName
 from iris.rpc import controller_pb2, job_pb2
 from iris.time_proto import duration_from_proto
-
-logger = logging.getLogger(__name__)
-
-
-def _job_constraints_json(request: controller_pb2.Controller.LaunchJobRequest, job_id: JobName) -> str | None:
-    """Serialize the job's constraints, folding in the deprecated reservation field.
-
-    Reservations were replaced by hard ``availability:<variant>`` constraints. A
-    pre-availability client may still set ``request.reservation``; we convert each
-    entry to an availability constraint here (the single server-side ingestion point)
-    and never persist anything reservation-shaped. Converted constraints are
-    deduplicated against constraints the request already carries.
-    """
-    constraints = list(request.constraints)
-    if not (request.HasField("reservation") and request.reservation.entries):
-        return constraints_to_json(constraints)
-
-    existing_keys = {c.key for c in constraints}
-    converted = [
-        c.to_proto()
-        for c in availability_constraints_from_reservation(request.reservation)
-        if c.key not in existing_keys
-    ]
-    if converted:
-        logger.warning(
-            "Job %s submitted with the deprecated `reservation` field; converting it to "
-            "availability constraints %s. Update the client to pass availability constraints directly.",
-            job_id.to_wire(),
-            [c.key for c in converted],
-        )
-        constraints.extend(converted)
-    return constraints_to_json(constraints)
 
 
 def _extract_resource_cols(resources: job_pb2.ResourceSpecProto | None) -> tuple[int, int, int, str | None]:
@@ -118,18 +83,72 @@ def _materialize_tasks(
     writes.bulk_insert_tasks(cur, rows)
 
 
+@dataclass(frozen=True)
+class JobInsertResult:
+    """What :func:`insert_job_and_config` computed, for the task-materialization
+    and audit steps the caller runs next."""
+
+    replicas: int
+    effective_submission_ms: int
+    root_submitted_ms: int
+    band_sort_key: int
+    validation_error: str | None
+
+
 def submit(
     cur: Tx,
     *,
     job_id: JobName,
     request: controller_pb2.Controller.LaunchJobRequest,
     ts: Timestamp,
-    run_template_cache: RunTemplateCache,
+    submitting_user: str | None = None,
 ) -> None:
-    """Insert the job row and expand its tasks. Caller owns the transaction."""
-    # Same-name replacement reuses ``job_id``; drop any stale cached
-    # template before the new row's fields land in the DB.
-    run_template_cache.pop(job_id.to_wire())
+    """Insert the job row and expand its tasks. Caller owns the transaction.
+
+    ``submitting_user`` is the authenticated principal for a root submission; a
+    child ignores it and inherits its root's value (see :func:`insert_job_and_config`).
+    """
+    inserted = insert_job_and_config(cur, job_id=job_id, request=request, ts=ts, submitting_user=submitting_user)
+    if inserted.validation_error is None:
+        _materialize_tasks(
+            cur,
+            job_id=job_id,
+            num_tasks=inserted.replicas,
+            submitted_at_ms=inserted.effective_submission_ms,
+            max_retries_failure=int(request.max_retries_failure),
+            max_retries_preemption=int(request.max_retries_preemption),
+            priority_root_submitted_ms=inserted.root_submitted_ms,
+            priority_band=inserted.band_sort_key,
+        )
+    cur.register(
+        lambda: log_event(
+            "job_submitted",
+            job_id.to_wire(),
+            num_tasks=inserted.replicas,
+            error=inserted.validation_error,
+        )
+    )
+
+
+def insert_job_and_config(
+    cur: Tx,
+    *,
+    job_id: JobName,
+    request: controller_pb2.Controller.LaunchJobRequest,
+    ts: Timestamp,
+    cluster: str = LOCAL_CLUSTER,
+    submitting_user: str | None = None,
+) -> JobInsertResult:
+    """Insert the ``jobs`` + ``job_config`` (+ workdir file) rows for one job.
+
+    Does NOT materialize tasks — :func:`submit` adds them for a local job; a
+    federated handoff (``cluster`` set to a peer) has no local tasks (the peer
+    creates them; the sync mirrors them back). Caller owns the transaction.
+
+    ``submitting_user`` — the authenticated principal — is required for a root and
+    stored verbatim. A child ignores it and inherits its root's stored value, so a
+    federated subtree keeps the root's submitter no matter who spawns each child.
+    """
 
     submitted_ms = ts.epoch_ms()
 
@@ -146,29 +165,28 @@ def submit(
     root_submitted_ms = effective_submission_ms
     if job_id.parent is not None:
         parent_row = cur.execute(
-            select(jobs_table.c.root_submitted_at_ms).where(jobs_table.c.job_id == bindparam("job_id")),
+            select(jobs_table.c.root_submitted_at_ms, jobs_table.c.submitting_user).where(
+                jobs_table.c.job_id == bindparam("job_id")
+            ),
             {"job_id": job_id.parent},
         ).first()
         if parent_row is None:
             raise ValueError(f"Cannot submit job {job_id}: parent {parent_job_id} is absent from the database")
         root_submitted_ms = parent_row.root_submitted_at_ms.epoch_ms()
+        # A child inherits its root's submitter, never re-resolving to the acting
+        # caller: a federated subtree stays attributed to the principal that
+        # launched the root.
+        submitting_user = parent_row.submitting_user
+    elif submitting_user is None:
+        # A root with no resolved principal is an identity-less direct/loopback
+        # submit — the same case the submit-time resolver attributes to local_admin.
+        submitting_user = LOCAL_ADMIN_SUBMITTER
 
     deadline_epoch_ms: int | None = None
     if request.HasField("scheduling_timeout") and request.scheduling_timeout.milliseconds > 0:
         deadline_epoch_ms = (
             Timestamp.from_ms(effective_submission_ms).add(duration_from_proto(request.scheduling_timeout)).epoch_ms()
         )
-
-    # Idempotently create a ``users`` row at submission time.
-    cur.execute(
-        sqlite_insert(users_table)
-        .values(
-            user_id=job_id.user,
-            created_at_ms=Timestamp.from_ms(effective_submission_ms),
-            role="user",
-        )
-        .on_conflict_do_nothing(index_elements=["user_id"])
-    )
 
     requested_band = int(request.priority_band)
     if requested_band != job_pb2.PRIORITY_BAND_UNSPECIFIED:
@@ -190,7 +208,7 @@ def submit(
 
     res = request.resources if request.HasField("resources") else None
     res_cpu, res_mem, res_disk, res_device = _extract_resource_cols(res)
-    constraints_json = _job_constraints_json(request, job_id)
+    constraints_json = constraints_to_json(list(request.constraints))
     has_cosched = 1 if request.HasField("coscheduling") else 0
     cosched_group = request.coscheduling.group_by if has_cosched else ""
     sched_timeout: int | None = (
@@ -209,6 +227,7 @@ def submit(
         cur,
         job_id=job_id,
         user_id=job_id.user,
+        submitting_user=submitting_user,
         parent_job_id=parent_job_id,
         root_job_id=job_id.root_job.to_wire(),
         depth=job_id.depth,
@@ -222,6 +241,7 @@ def submit(
         exit_code=None,
         num_tasks=replicas,
         name=job_name_lower,
+        cluster=cluster,
     )
     writes.insert_job_config(
         cur,
@@ -247,6 +267,7 @@ def submit(
         existing_job_policy=int(request.existing_job_policy),
         priority_band=int(request.priority_band),
         task_image=request.task_image,
+        container_profile=int(request.container_profile),
         submit_argv_json=list(request.submit_argv),
         fail_if_exists=bool(request.fail_if_exists),
     )
@@ -258,25 +279,33 @@ def submit(
             [{"job_id": job_id, "filename": name, "data": data} for name, data in workdir_files.items()],
         )
 
-    if validation_error is None:
-        _materialize_tasks(
+    # A received handoff runs as an ordinary local job, but is recorded as a
+    # RECEIVED federated_jobs row (after the jobs row, per the FK) naming the
+    # requester, so FederationSync reports it back only to that requester and the
+    # changelog events below (and its tasks') resolve their requester from it.
+    if request.HasField("federation"):
+        writes.insert_received_handle(
             cur,
             job_id=job_id,
-            num_tasks=replicas,
-            submitted_at_ms=effective_submission_ms,
-            max_retries_failure=int(request.max_retries_failure),
-            max_retries_preemption=int(request.max_retries_preemption),
-            priority_root_submitted_ms=root_submitted_ms,
-            priority_band=band_sort_key,
+            requester_id=request.federation.requester_id,
+            owner_principal=request.federation.owner_principal,
         )
 
-    cur.register(
-        lambda: log_event(
-            "job_submitted",
-            job_id.to_wire(),
-            num_tasks=replicas,
-            error=validation_error,
-        )
+    # Record the job-level creation for any requester federating with this peer (a
+    # no-op unless this job's root was received via handoff).
+    writes.record_federation_change(cur, job_id)
+
+    # Invalidate post-commit so a concurrent reader cannot refill the template
+    # cache from the pre-commit snapshot and have that stale value persist past
+    # the new row's commit.
+    cur.caches[RunTemplatesProjection].invalidate_for_job(cur, job_id)
+
+    return JobInsertResult(
+        replicas=replicas,
+        effective_submission_ms=effective_submission_ms,
+        root_submitted_ms=root_submitted_ms,
+        band_sort_key=band_sort_key,
+        validation_error=validation_error,
     )
 
 
@@ -285,7 +314,6 @@ def cancel(
     *,
     job_id: JobName,
     reason: str,
-    endpoints: EndpointsProjection,
 ) -> None:
     """Cancel ``job_id`` and its descendant subtree through the kernel.
 
@@ -307,13 +335,13 @@ def cancel(
     # No per-job state preload: the cascade-kill merge guard skips already-
     # terminal rows (excluding WORKER_FAILED, which cancel overwrites).
     effects = ReconcileState.open(snapshot).cancel_job(job_id, reason, now)
-    commit_effects(cur, effects, endpoints=endpoints)
-    # Sweep endpoints that survived because their owning task was already
-    # terminal before cancel ran (kernel only emits EndpointDeletion for
-    # tasks we actively killed). Derive the same subtree the kernel cancelled
-    # from the snapshot's transitive descendants.
+    commit_effects(cur, effects)
+    # Fast-path clear of the cancelled subtree's endpoints (the FK CASCADE
+    # backstop): cancellation stops routing to these endpoints at once rather
+    # than waiting out their lease. Derive the subtree from the snapshot's
+    # transitive descendants.
     subtree = [job_id, *snapshot.job_descendants[job_id].descendants]
-    endpoints.remove_by_job_ids(cur, subtree)
+    cur.caches[EndpointsProjection].remove_by_job_ids(cur, subtree)
 
 
 def remove_finished(

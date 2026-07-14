@@ -14,23 +14,23 @@ deduplication.fuzzy_dups.compute_fuzzy_dups_attrs` consumes one or more of
 these artifacts to produce duplicate markers.
 """
 
-from __future__ import annotations
-
 import logging
 import os
 from collections.abc import Iterator
 
 import dupekit
 import pyarrow as pa
-from fray import ResourceConfig
+from fray.types import ResourceConfig
 from pydantic import BaseModel
-from zephyr import Dataset, ZephyrContext, counters
+from rigging.filesystem import StoragePath, prefix_join
+from zephyr import counters
+from zephyr.dataset import Dataset
+from zephyr.execution import ZephyrContext
 
 from marin.datakit.normalize import NormalizedData
-from marin.execution.artifact import Artifact
+from marin.execution.artifact import read_artifact
 from marin.execution.step_spec import StepSpec
 from marin.processing.classification.deduplication.dedup_commons import _load_batches
-from marin.utils import fsspec_glob
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ class MinHashAttrData(BaseModel):
     params: MinHashParams
     source_main_dir: str
     attr_dir: str
-    counters: dict[str, int]
+    counters: dict[str, int | float]
 
 
 def _attr_records(batch: pa.RecordBatch, params: MinHashParams) -> list[dict]:
@@ -108,7 +108,7 @@ def _attr_records(batch: pa.RecordBatch, params: MinHashParams) -> list[dict]:
             else:
                 truncated.append(text)
         if n_truncated:
-            counters.increment("minhash/text_truncated", n_truncated)
+            counters.pipeline.update_counter("minhash/text_truncated", n_truncated)
         batch = batch.set_column(
             batch.schema.get_field_index("text"),
             "text",
@@ -134,11 +134,11 @@ def _attr_records(batch: pa.RecordBatch, params: MinHashParams) -> list[dict]:
     out: list[dict] = []
     for doc_id, doc_buckets in zip(ids, buckets_col, strict=True):
         if not doc_buckets.is_valid:
-            counters.increment("minhash/empty_signatures")
+            counters.pipeline.update_counter("minhash/empty_signatures", 1)
             continue
         bucket_strs = [str(b) for b in doc_buckets.as_py()]
-        counters.increment("minhash/documents")
-        counters.increment("minhash/buckets", len(bucket_strs))
+        counters.pipeline.update_counter("minhash/documents", 1)
+        counters.pipeline.update_counter("minhash/buckets", len(bucket_strs))
         out.append({"id": doc_id.as_py(), "buckets": bucket_strs})
     return out
 
@@ -160,7 +160,8 @@ def compute_minhash_attrs(
     seed: int = 42,
     worker_resources: ResourceConfig | None = None,
     max_workers: int | None = None,
-    map_workers_per_actor: int | None = None,
+    map_task_resources: ResourceConfig | None = None,
+    reduce_task_resources: ResourceConfig | None = None,
 ) -> MinHashAttrData:
     """Compute MinHash bucket attributes for *source* and persist as Parquet.
 
@@ -187,8 +188,10 @@ def compute_minhash_attrs(
         worker_resources: Per-worker resource request. Sized similarly to the
             old ``dedup_fuzzy_document``: dupekit's Rust MinHash pipeline uses
             a native thread pool and may consume up to ~2 cores beyond the
-            Python thread.
+            Python thread. Required when ``map_task_resources`` is set.
         max_workers: Max Zephyr workers. Defaults to Zephyr's own default.
+        map_task_resources: ResourceConfig for map-stage tasks.
+        reduce_task_resources: ResourceConfig for reduce-stage tasks.
 
     Returns:
         :class:`MinHashAttrData` describing the attr directory and counters.
@@ -203,9 +206,9 @@ def compute_minhash_attrs(
         seed=seed,
         text_cap_chars=text_cap_chars,
     )
-    attr_dir = os.path.join(output_path, "outputs")
+    attr_dir = prefix_join(output_path, "outputs")
 
-    source_shards = sorted(fsspec_glob(f"{source.main_output_dir.rstrip('/')}/*.parquet"))
+    source_shards = sorted(str(m) for m in StoragePath(prefix_join(source.main_output_dir, "*.parquet")).glob())
     if not source_shards:
         raise FileNotFoundError(f"No parquet shards found under {source.main_output_dir}")
 
@@ -223,15 +226,17 @@ def compute_minhash_attrs(
     }
     if max_workers is not None:
         ctx_kwargs["max_workers"] = max_workers
-    if map_workers_per_actor is not None:
-        ctx_kwargs["map_workers_per_actor"] = map_workers_per_actor
+    if map_task_resources is not None:
+        ctx_kwargs["map_task_resources"] = map_task_resources
+    if reduce_task_resources is not None:
+        ctx_kwargs["reduce_task_resources"] = reduce_task_resources
     ctx = ZephyrContext(**ctx_kwargs)
 
     # Preserve source basenames; zephyr's `{basename}` placeholder is synthetic.
     output_basenames = tuple(os.path.basename(p) for p in source_shards)
 
     def _output_path(shard_idx: int, total_shards: int, ad: str = attr_dir, bn: tuple = output_basenames) -> str:
-        return f"{ad}/{bn[shard_idx]}"
+        return prefix_join(ad, bn[shard_idx])
 
     pipeline = (
         Dataset.from_list(source_shards)
@@ -266,7 +271,7 @@ def compute_minhash_attrs_step(
         name=name,
         deps=[normalize],
         fn=lambda output_path: compute_minhash_attrs(
-            source=Artifact.from_path(normalize, NormalizedData),
+            source=read_artifact(normalize.output_path, NormalizedData),
             output_path=output_path,
             num_perms=num_perms,
             num_bands=num_bands,

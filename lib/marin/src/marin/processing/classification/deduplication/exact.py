@@ -8,9 +8,13 @@ from typing import Any, TypeVar
 import dupekit
 import humanfriendly
 import pyarrow as pa
-from fray import ResourceConfig
-from zephyr import DEFAULT_FILE_PATH_COLUMN, ZephyrContext, counters, write_parquet_file
+from fray.types import ResourceConfig
+from rigging.filesystem import rebase_file_path
+from zephyr import counters
 from zephyr.dataset import Dataset
+from zephyr.execution import ZephyrContext
+from zephyr.readers import DEFAULT_FILE_PATH_COLUMN
+from zephyr.writers import write_parquet_file
 
 from marin.processing.classification.deduplication.dedup_commons import (
     DEFAULT_FILETYPES,
@@ -23,7 +27,6 @@ from marin.processing.classification.deduplication.dedup_commons import (
     finalize_dedup,
     make_document_dedup_aggregator,
 )
-from marin.utils import rebase_file_path
 
 logger = logging.getLogger(__name__)
 
@@ -47,14 +50,32 @@ def _iter_has_more_than_one(records: Iterator[T]) -> tuple[bool, T, Iterator[T]]
     return has_more_than_one, first, itertools.chain([first], rest)
 
 
+def _annotate_dups(records: Iterator[dict[str, Any]], *, include_span: bool) -> Iterator[dict[str, Any]]:
+    """Mark every non-canonical record in a hash group as a duplicate.
+
+    ``records`` are the members of a single hash group, pre-sorted by ``id`` so the
+    first record is the deterministic canonical keeper. Every other record with a
+    different ``id`` is a duplicate. When *include_span* is set (paragraph dedup),
+    the offending paragraph span is attached — empty for non-duplicate records.
+    """
+    has_dups, head_record, records = _iter_has_more_than_one(records)
+
+    # NOTE: we **arbitrarily** select the 1st record as the canonical record
+    cano_id = head_record["id"]
+
+    for item in records:
+        is_dup = has_dups and item["id"] != cano_id
+        annotated = {"id": item["id"], "is_dup": is_dup, "file_idx": item["file_idx"]}
+        if include_span:
+            annotated["span"] = item["paragraph_span"]["span"] if is_dup else []
+        yield annotated
+
+
 def dedup_exact_paragraph(
     *,
     input_paths: str | list[str],
     output_path: str,
     text_field: str = "text",
-    max_parallelism: int,
-    worker_resources: ResourceConfig | None = None,
-    coordinator_resources: ResourceConfig | None = None,
 ) -> dict:
     input_files = _collect_input_files(input_paths=input_paths, filetypes=["parquet"])
     idx_to_path = dict(list(enumerate(input_files)))
@@ -77,12 +98,10 @@ def dedup_exact_paragraph(
 
     ctx_kwargs: dict = {
         "name": "exact-para-dedup",
-        "max_workers": max_parallelism,
-        "resources": worker_resources or ResourceConfig(cpu=1, ram="32g", disk="5g"),
-        "map_workers_per_actor": 3,
+        "resources": (resources := ResourceConfig(cpu=10, ram="100g", disk="20g")),
+        "map_task_resources": resources.scale(0.1),  # 1 cpu / 10g / 2g
+        "reduce_task_resources": resources.scale(cpu=0.1, ram=0.2, disk=0.1),  # 1 cpu / 20g / 2g
     }
-    if coordinator_resources is not None:
-        ctx_kwargs["coordinator_resources"] = coordinator_resources
     ctx = ZephyrContext(**ctx_kwargs)
 
     def aggregate_and_write_to_corresponding_files(file_idx: int, records: Iterator[dict]) -> dict:
@@ -104,12 +123,12 @@ def dedup_exact_paragraph(
             for record in records:
                 is_dup: bool = record["is_dup"]
                 total += 1
-                counters.increment("dedup/exact/paragraph/total")
+                counters.pipeline.update_counter("dedup/exact/paragraph/total", 1)
                 if is_dup:
                     dups += 1
-                    counters.increment("dedup/exact/paragraph/dups")
+                    counters.pipeline.update_counter("dedup/exact/paragraph/dups", 1)
                 else:
-                    counters.increment("dedup/exact/paragraph/unique")
+                    counters.pipeline.update_counter("dedup/exact/paragraph/unique", 1)
                 yield record
 
         def group_by_doc_id(records: Iterator[dict]) -> Iterator[dict]:
@@ -138,24 +157,9 @@ def dedup_exact_paragraph(
         result = write_parquet_file(group_by_doc_id(counting_iter()), output_file)
         return {**result, "total": total, "dups": dups, "unique": total - dups}
 
-    def annotate_dups(key_hash: str, records: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-        has_dups, head_record, records = _iter_has_more_than_one(records)
-
-        # NOTE: we **arbitrarily** select the 1st record as the canonical record
-        cano_id = head_record["id"]
-
-        for item in records:
-            is_dup = has_dups and item["id"] != cano_id
-            yield {
-                "id": item["id"],
-                "is_dup": is_dup,
-                "span": item["paragraph_span"]["span"] if is_dup else [],
-                "file_idx": item["file_idx"],
-            }
-
     def _flat_map_paragraph_hashes(batch: pa.RecordBatch) -> Iterator[dict]:
         hashes = compute_paragraph_hashes(batch).to_pylist()
-        counters.increment("hash/paragraphs", len(hashes))
+        counters.pipeline.update_counter("hash/paragraphs", len(hashes))
         for hash_record in hashes:
             yield {
                 "file_idx": path_to_idx[hash_record.pop(DEFAULT_FILE_PATH_COLUMN)],
@@ -171,7 +175,7 @@ def dedup_exact_paragraph(
             lambda record: record["hash"],
             # NOTE: selecting the canonical record is deterministic via this sort
             sort_by=lambda record: record["id"],
-            reducer=annotate_dups,
+            reducer=lambda _hash, records: _annotate_dups(records, include_span=True),
         )
         .group_by(
             lambda r: r["file_idx"],
@@ -227,24 +231,10 @@ def dedup_exact_document(
         counter_prefix="dedup/exact/document",
     )
 
-    def annotate_dups(key_hash: str, records: Iterator[dict[str, Any]]) -> Iterator[dict[str, Any]]:
-        has_dups, head_record, records = _iter_has_more_than_one(records)
-
-        # NOTE: we **arbitrarily** select the 1st record as the canonical record
-        cano_id = head_record["id"]
-
-        for item in records:
-            is_dup = has_dups and item["id"] != cano_id
-            yield {
-                "id": item["id"],
-                "is_dup": is_dup,
-                "file_idx": item["file_idx"],
-            }
-
     def _flat_map_document_hashes(path: str) -> Iterator[dict]:
         for batch in _load_batches(path):
             hashes = compute_document_hashes(batch).to_pylist()
-            counters.increment("hash/documents", len(hashes))
+            counters.pipeline.update_counter("hash/documents", len(hashes))
             for hash_record in hashes:
                 yield {"file_idx": path_to_idx[path], **hash_record}
 
@@ -255,7 +245,7 @@ def dedup_exact_document(
             lambda record: record["hash"],
             # NOTE: selecting the canonical record is deterministic via this sort
             sort_by=lambda record: record["id"],
-            reducer=annotate_dups,
+            reducer=lambda _hash, records: _annotate_dups(records, include_span=False),
         )
         .group_by(lambda r: r["file_idx"], sort_by=lambda r: r["id"], reducer=aggregate_and_write),
         verbose=True,

@@ -42,8 +42,6 @@ class TaskRowDelta:
     exit_code: int | None = None
     started_at: Timestamp | None = None
     finished_at: Timestamp | None = None
-    failure_count: int | None = None
-    preemption_count: int | None = None
     container_id: str | None = None
 
 
@@ -81,11 +79,6 @@ class JobRowDelta:
 # ---------------------------------------------------------------------------
 # Cross-aggregate effect categories
 # ---------------------------------------------------------------------------
-
-
-@dataclass(frozen=True, slots=True)
-class EndpointDeletion:
-    task_id: JobName
 
 
 @dataclass(slots=True)
@@ -129,6 +122,14 @@ class ControllerEffects:
     attempts: dict[tuple[JobName, int], AttemptRowDelta] = field(default_factory=dict)
     jobs: dict[JobName, JobRowDelta] = field(default_factory=dict)
 
-    endpoint_deletions: list[EndpointDeletion] = field(default_factory=list)
     health: WorkerHealthEffect = field(default_factory=WorkerHealthEffect)
     log_events: list[LogEvent] = field(default_factory=list)
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether this batch records no committable writes.
+
+        ``health.build_failed`` is excluded: it is folded into the liveness
+        tracker by the backend, never persisted by ``commit_effects``.
+        """
+        return not (self.tasks or self.attempts or self.jobs or self.log_events)

@@ -7,8 +7,6 @@ Unit tests cover the pure helpers (``attach_id``, ``IdPreservingPreprocessor``).
 The slow integration test exercises the A→B pipeline end-to-end against the
 legacy ``tokenize()`` path on a tiny local parquet fixture.
 """
-from __future__ import annotations
-
 import json
 import os
 
@@ -16,7 +14,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
-from levanter.data.text import TextLmDatasetFormat
+from levanter.data.text.formats import TextLmDatasetFormat
 from levanter.store.cache import CacheLedger, TreeCache
 from marin.datakit.normalize import NormalizedData, generate_id
 from marin.execution.step_spec import StepSpec

@@ -26,16 +26,10 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypeVar
 
+from finelog.client.log_client import Table
 from rigging.timing import Duration, Timestamp, TokenBucket
 
-from iris.cluster.backends.protocols import WorkerInfraProvider
-from iris.cluster.backends.types import (
-    CloudSliceState,
-    QuotaExhaustedError,
-    RemoteWorkerHandle,
-    SliceHandle,
-    SliceStatus,
-)
+from iris.cluster.config import AutoscalerConfig, WorkerConfig
 from iris.cluster.constraints import Constraint
 from iris.cluster.controller.autoscaler.models import (
     DemandEntry,
@@ -46,6 +40,12 @@ from iris.cluster.controller.autoscaler.operations import (
     terminate_slices_for_workers as terminate_slices_for_workers_operation,
 )
 from iris.cluster.controller.autoscaler.planning import build_scale_plan
+from iris.cluster.controller.autoscaler.provisioning import (
+    ERROR_MESSAGE_MAX_LEN,
+    IrisProvisioning,
+    ProvisioningOutcome,
+    classify_create_failure,
+)
 from iris.cluster.controller.autoscaler.recovery import (
     load_autoscaler_checkpoint,
     restore_autoscaler_state,
@@ -65,9 +65,17 @@ from iris.cluster.controller.autoscaler.status import PendingHint, build_job_pen
 from iris.cluster.controller.autoscaler.worker_registry import TrackedWorker, WorkerRegistry
 from iris.cluster.controller.db import ControllerDB
 from iris.cluster.controller.worker_health import CONSECUTIVE_FAILURE_THRESHOLD
+from iris.cluster.platforms.protocols import WorkerInfraProvider
+from iris.cluster.platforms.types import (
+    CloudSliceState,
+    QuotaExhaustedError,
+    RemoteWorkerHandle,
+    SliceHandle,
+    SliceStatus,
+)
 from iris.cluster.types import WorkerStatusMap
-from iris.rpc import config_pb2, vm_pb2
-from iris.time_proto import duration_from_proto, timestamp_to_proto
+from iris.rpc import job_pb2, vm_pb2
+from iris.time_proto import timestamp_to_proto
 
 logger = logging.getLogger(__name__)
 
@@ -192,10 +200,11 @@ class Autoscaler:
         scale_groups: dict[str, ScalingGroup],
         evaluation_interval: Duration,
         platform: WorkerInfraProvider,
-        base_worker_config: config_pb2.WorkerConfig | None = None,
+        base_worker_config: WorkerConfig | None = None,
         unresolvable_timeout: Duration = DEFAULT_UNRESOLVABLE_TIMEOUT,
         create_rate_limit: int = DEFAULT_CREATE_RATE_LIMIT,
         make_draining_group: Callable[[str], ScalingGroup] | None = None,
+        provisioning_table: Table | None = None,
     ):
         """Create autoscaler with explicit parameters.
 
@@ -211,6 +220,8 @@ class Autoscaler:
             make_draining_group: Builds a scale-to-zero ``ScalingGroup`` for a scale group that has
                 left config but still has live VMs (see ``restore_autoscaler_state``). None disables
                 drain adoption (test/local mode); the factory always wires it in prod.
+            provisioning_table: finelog ``iris.provisioning`` table for slice-provisioning
+                outcomes. None disables emission (test/local mode without finelog).
         """
         self._groups = scale_groups
         self._make_draining_group = make_draining_group
@@ -230,6 +241,11 @@ class Autoscaler:
         # Bounded log of recent autoscaler actions for dashboard/debugging
         self._action_log: deque[vm_pb2.AutoscalerAction] = deque(maxlen=100)
 
+        # finelog table for the iris.provisioning namespace, built from the
+        # controller's log client before construction. None in test/local mode
+        # disables emission.
+        self._provisioning_table: Table | None = provisioning_table
+
         self._last_evaluation: Timestamp = Timestamp.from_ms(0)
 
         # Most recent routing decision, materialized as status protos. Dashboard
@@ -242,30 +258,33 @@ class Autoscaler:
     def from_config(
         cls,
         scale_groups: dict[str, ScalingGroup],
-        config: config_pb2.AutoscalerConfig,
+        config: AutoscalerConfig,
         platform: WorkerInfraProvider,
-        base_worker_config: config_pb2.WorkerConfig | None = None,
+        base_worker_config: WorkerConfig | None = None,
         make_draining_group: Callable[[str], ScalingGroup] | None = None,
+        provisioning_table: Table | None = None,
     ) -> "Autoscaler":
-        """Create autoscaler from proto config.
+        """Create autoscaler from config.
 
         Args:
             scale_groups: Map of scale group name to ScalingGroup instance
-            config: Autoscaler configuration proto (with defaults already applied)
+            config: Autoscaler configuration (with defaults already applied)
             platform: WorkerInfraProvider instance for shutdown lifecycle
             base_worker_config: Base worker config merged with per-group overrides
             make_draining_group: Builds a scale-to-zero group for a retired-but-live scale group
                 (see ``Autoscaler.__init__`` / ``restore_autoscaler_state``).
+            provisioning_table: finelog ``iris.provisioning`` table for slice-provisioning outcomes.
 
         Returns:
             Configured Autoscaler instance
         """
         return cls(
             scale_groups=scale_groups,
-            evaluation_interval=duration_from_proto(config.evaluation_interval),
+            evaluation_interval=config.evaluation_interval,
             platform=platform,
             base_worker_config=base_worker_config,
             make_draining_group=make_draining_group,
+            provisioning_table=provisioning_table,
         )
 
     def shutdown(self) -> None:
@@ -285,6 +304,38 @@ class Autoscaler:
     def __exit__(self, *exc) -> None:
         self.shutdown()
 
+    def _record_provisioning_outcome(
+        self,
+        group: ScalingGroup,
+        outcome: ProvisioningOutcome,
+        *,
+        created_at: Timestamp | None = None,
+        error_message: str = "",
+        worker_count: int = 0,
+    ) -> None:
+        """Write one ``iris.provisioning`` row; no-op until the sink is injected."""
+        table = self._provisioning_table
+        if table is None:
+            return
+        latency_ms = 0
+        if outcome == ProvisioningOutcome.READY and created_at is not None:
+            latency_ms = max(0, Timestamp.now().epoch_ms() - created_at.epoch_ms())
+        table.write(
+            [
+                IrisProvisioning(
+                    ts=Timestamp.now().as_naive_utc(),
+                    resource_type=group.device_type.value,
+                    scale_group=group.name,
+                    zone=group.zone or "",
+                    accelerator_variant=group.accelerator_variant,
+                    outcome=outcome.value,
+                    error_message=error_message[:ERROR_MESSAGE_MAX_LEN],
+                    worker_count=worker_count,
+                    provision_latency_ms=latency_ms,
+                )
+            ]
+        )
+
     def _log_action(
         self,
         action_type: str,
@@ -292,22 +343,20 @@ class Autoscaler:
         slice_id: str = "",
         reason: str = "",
         status: str = "completed",
+        *,
+        group: ScalingGroup | None = None,
+        outcome: ProvisioningOutcome | None = None,
+        created_at: Timestamp | None = None,
+        worker_count: int = 0,
     ) -> vm_pb2.AutoscalerAction:
-        """Log an autoscaler action to the bounded action log.
+        """Append an autoscaler action to the bounded action log and return it.
 
-        Args:
-            action_type: Type of action (scale_up, scale_down, etc.)
-            scale_group: Name of the scale group
-            slice_id: ID of the slice (if applicable)
-            reason: Human-readable reason for the action
-            status: Action status ("pending", "completed", "failed")
-
-        Returns:
-            The action object. The caller may mutate this object to update
-            status after execution (e.g., from "pending" to "completed").
-            This works because the deque holds references to the proto objects.
+        The returned action is mutable so callers can update its status after
+        execution (e.g. pending → completed). When ``outcome`` is given, the same
+        call also writes the structured :class:`IrisProvisioning` row — the action
+        log line and the provisioning row are two views of one event, sharing
+        ``reason`` as the row's ``error_message`` — so an outcome site logs once.
         """
-
         action = vm_pb2.AutoscalerAction(
             timestamp=timestamp_to_proto(Timestamp.now()),
             action_type=action_type,
@@ -325,6 +374,11 @@ class Autoscaler:
             status,
             reason,
         )
+        if outcome is not None:
+            assert group is not None, "provisioning outcome requires the ScalingGroup"
+            self._record_provisioning_outcome(
+                group, outcome, created_at=created_at, error_message=reason, worker_count=worker_count
+            )
         return action
 
     def evaluate(
@@ -536,6 +590,10 @@ class Autoscaler:
             action.action_type = "quota_exceeded"
             action.status = "failed"
             action.reason = str(error)
+            # A create that failed at submit (no slice handle, so no later
+            # describe() outcome) — record it here or it's invisible to the
+            # success rate. Quota/stockout both surface as QuotaExhaustedError.
+            self._record_provisioning_outcome(group, classify_create_failure(str(error)), error_message=str(error))
             return
 
         group.cancel_scale_up()
@@ -543,8 +601,9 @@ class Autoscaler:
         action.status = "failed"
         action.reason = f"{request.reason} - error: {error}"
         group.record_create_failed(ts)
+        self._record_provisioning_outcome(group, ProvisioningOutcome.ERROR, error_message=str(error))
 
-    def _per_group_worker_config(self, group: ScalingGroup) -> config_pb2.WorkerConfig | None:
+    def _per_group_worker_config(self, group: ScalingGroup) -> WorkerConfig | None:
         """Build per-group WorkerConfig by merging base config with scale group overrides."""
         return build_worker_config_for_group(self._base_worker_config, group.config)
 
@@ -592,7 +651,7 @@ class Autoscaler:
         )
 
         # Phase 3: fold describe results into group state serially.
-        for (group, slice_id, _handle), status in zip(targets, statuses, strict=True):
+        for (group, slice_id, handle), status in zip(targets, statuses, strict=True):
             if status is None:
                 continue
             if status.state == CloudSliceState.READY:
@@ -605,6 +664,10 @@ class Autoscaler:
                     group.name,
                     slice_id,
                     reason=f"bootstrap completed ({len(worker_ids)} workers)",
+                    group=group,
+                    outcome=ProvisioningOutcome.READY,
+                    created_at=handle.created_at,
+                    worker_count=len(worker_ids),
                 )
             elif status.state == CloudSliceState.FAILED:
                 group.mark_slice_failed(slice_id, error_message=status.error_message)
@@ -618,6 +681,8 @@ class Autoscaler:
                     slice_id,
                     reason=reason,
                     status="failed",
+                    group=group,
+                    outcome=classify_create_failure(reason),
                 )
             elif status.state == CloudSliceState.UNKNOWN:
                 # Measure how long the slice has been CONTINUOUSLY UNKNOWN, not its
@@ -636,6 +701,8 @@ class Autoscaler:
                         slice_id,
                         reason=f"unresolvable for {unknown_for}",
                         status="failed",
+                        group=group,
+                        outcome=ProvisioningOutcome.ERROR,
                     )
                 else:
                     logger.debug(
@@ -723,9 +790,9 @@ class Autoscaler:
                     logger.warning("Slice %s: %s; terminating", slice_id, reason)
                     tripped[slice_id] = (group, reason)
 
-        # Phase 4: terminate tripped slices. Record as a PREEMPTED-style death,
-        # not a boot failure — these slices booted cleanly and only died at
-        # runtime, so the BackoffDetector's scale-up budget shouldn't decay.
+        # Phase 4: terminate tripped slices. These booted cleanly and only died
+        # at runtime, so record PREEMPTED (excluded from the create success rate),
+        # not a boot failure — the BackoffDetector's scale-up budget shouldn't decay.
         for slice_id, (group, reason) in tripped.items():
             group.mark_slice_failed(slice_id, error_message=reason)
             group.scale_down(slice_id, timestamp)
@@ -736,6 +803,8 @@ class Autoscaler:
                 slice_id,
                 reason=reason,
                 status="failed",
+                group=group,
+                outcome=ProvisioningOutcome.PREEMPTED,
             )
 
     def _worker_urls(self, workers: Sequence[RemoteWorkerHandle]) -> dict[str, str]:
@@ -848,6 +917,7 @@ class Autoscaler:
         constraints: list[Constraint],
         *,
         replicas: int | None = None,
+        resources: job_pb2.ResourceSpecProto | None = None,
     ) -> str | None:
         """Gate LaunchJob: can this job shape ever be scheduled?
 
@@ -856,9 +926,11 @@ class Autoscaler:
         reason suitable for returning to the caller.
 
         `replicas` applies only to coscheduled jobs — None skips the
-        num_vms-divisibility check.
+        num_vms-divisibility check. `resources`, when given, additionally
+        rejects requests whose per-VM capacity (cpu/memory/disk/device count)
+        no matching group can satisfy.
         """
-        result = job_feasibility(self._groups.values(), constraints, replicas=replicas)
+        result = job_feasibility(self._groups.values(), constraints, replicas=replicas, resources=resources)
         return result.reason
 
     def get_last_routing_decision_proto(self) -> vm_pb2.RoutingDecision | None:
@@ -917,6 +989,14 @@ class Autoscaler:
             log_action=self._log_action,
             timestamp=Timestamp.now(),
         )
+        # These slices had registered workers (so they reached READY) and lost
+        # them at runtime — the primary preemption path, which the probe_health
+        # backstop never sees. Record PREEMPTED so they don't pollute the create
+        # success rate (mirrors the probe_health termination path).
+        for req in result.termination_requests:
+            self._record_provisioning_outcome(
+                req.group, ProvisioningOutcome.PREEMPTED, error_message="worker liveness lost"
+            )
         _run_io_batch(
             result.termination_requests,
             lambda req: req.group.terminate_slice_handle(req.handle, context="cleaning up anyway"),

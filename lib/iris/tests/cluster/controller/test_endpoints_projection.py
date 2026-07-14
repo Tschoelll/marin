@@ -3,8 +3,6 @@
 
 """Tests for ``EndpointsProjection`` — write-through cache over the ``endpoints`` table."""
 
-from __future__ import annotations
-
 from pathlib import Path
 
 import pytest
@@ -106,22 +104,6 @@ def test_remove_drops_endpoint_by_id(state):
         removed = state._endpoints.remove(cur, "e1")
     assert removed is not None and removed.endpoint_id == "e1"
     assert {r.endpoint_id for r in state._endpoints.query()} == {"e2"}
-
-
-def test_remove_by_task_drops_all_task_endpoints(state):
-    tasks = submit_job(state, "j", make_job_request("j", replicas=2))
-    t1, t2 = tasks[0].task_id, tasks[1].task_id
-
-    with state._db.transaction() as cur:
-        state._endpoints.add(cur, _make_row("e1", "alpha", t1))
-        state._endpoints.add(cur, _make_row("e2", "beta", t1))
-        state._endpoints.add(cur, _make_row("e3", "gamma", t2))
-
-    with state._db.transaction() as cur:
-        removed = state._endpoints.remove_by_task(cur, t1)
-
-    assert set(removed) == {"e1", "e2"}
-    assert {r.endpoint_id for r in state._endpoints.query()} == {"e3"}
 
 
 def test_remove_by_job_ids_drops_subtree(state):

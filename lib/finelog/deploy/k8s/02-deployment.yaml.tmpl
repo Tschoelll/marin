@@ -26,6 +26,7 @@ spec:
       labels:
         app: {{ name }}
     spec:
+{{ priority_class_block }}
       # The container runs as UID 1000 (finelog). fsGroup makes kubelet
       # chown the mounted PV to GID 1000 so writes succeed; without this
       # the PV root inherits root:root and parquet flushes EACCES.
@@ -33,6 +34,10 @@ spec:
         fsGroup: 1000
       containers:
         - name: finelog
+          # `finelog deploy` resolves the configured tag (e.g. `:latest`) to an
+          # immutable `@sha256:` digest before rendering, so this is a pinned
+          # reference and IfNotPresent is cache-safe — no node-cache staleness,
+          # and the spec records exactly what is running.
           image: {{ image }}
           imagePullPolicy: IfNotPresent
           # SYS_PTRACE lets memray/py-spy attach to the running server for
@@ -44,21 +49,36 @@ spec:
             - name: rpc
               containerPort: {{ port }}
               protocol: TCP
+          # The pod's secret environment: S3 credentials for an s3:// remote_log_dir
+          # (R2 AWS_* creds + AWS_ENDPOINT_URL) and FINELOG_SIGNING_KEY, the private
+          # key the forwarder signs its bearer with. `finelog deploy up` mints the
+          # `{{ name }}-env` Secret from the operator's env and the config's secret
+          # references. optional=true keeps the pod schedulable when no Secret exists
+          # (a gs:// archive with no forwarding needs none — GCS uses workload
+          # identity). The explicit env below wins on key collision.
+          envFrom:
+            - secretRef:
+                name: {{ name }}-env
+                optional: true
+          # FINELOG_AUTH_POLICY (public keys, network prefixes) and FINELOG_FORWARDING
+          # (a url and a cluster name) carry no secrets, so `finelog deploy up` splices
+          # them in below. Key material only ever arrives through the Secret above.
           env:
             - name: FINELOG_PORT
               value: "{{ port }}"
             - name: FINELOG_REMOTE_DIR
               value: "{{ remote_log_dir }}"
+{{ inline_env_block }}
           volumeMounts:
             - name: cache
               mountPath: /var/cache/finelog
           resources:
             requests:
               cpu: "500m"
-              memory: "1Gi"
+              memory: "4Gi"
             limits:
               cpu: "2"
-              memory: "4Gi"
+              memory: "32Gi"
           livenessProbe:
             tcpSocket:
               port: {{ port }}

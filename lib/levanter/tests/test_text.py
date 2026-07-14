@@ -14,26 +14,25 @@ import pytest
 
 import haliax as hax
 
-from levanter.data.text import (
-    BatchTokenizer,
-    ChatLmDatasetFormat,
+from levanter.data.text._batch_tokenizer import BatchTokenizer
+from levanter.data.text.cache import build_lm_dataset_cache
+from levanter.data.text.datasets import (
     ChatDataset,
     DatasetComponent,
-    GrugLmExample,
     LmDataConfig,
-    LmDatasetFormatBase,
-    PreferenceChatLmDatasetFormat,
-    PreferenceChatProcessor,
-    PrebuiltLmDatasetFormat,
-    SupervisedLmDatasetFormat,
     UrlDatasetSourceConfig,
-    build_lm_dataset_cache,
     count_corpus_sizes,
     dataset_for_component,
-    grug_lm_example_from_named,
-    named_lm_example_from_grug,
+)
+from levanter.data.text.examples import GrugLmExample, grug_lm_example_from_named, named_lm_example_from_grug
+from levanter.data.text.formats import (
+    ChatLmDatasetFormat,
+    LmDatasetFormatBase,
+    PrebuiltLmDatasetFormat,
+    SupervisedLmDatasetFormat,
     preprocessor_for_format,
 )
+from levanter.data.text.preference import PreferenceChatLmDatasetFormat, PreferenceChatProcessor
 from levanter.tokenizers import load_tokenizer
 from levanter.models.lm_model import LmExample
 from levanter.models.loss import maybe_fused_next_token_loss
@@ -362,6 +361,37 @@ def test_prebuilt_cache_with_loss_weights(tmp_path):
     np.testing.assert_array_equal(np.asarray(example.tokens), np.array(records[0]["input_ids"], dtype=np.int32))
     expected_loss_weight = np.array([2.0, 1.0, 0.0, 0.0], dtype=np.asarray(example.loss_weight).dtype)
     np.testing.assert_array_equal(np.asarray(example.loss_weight), expected_loss_weight)
+
+
+def test_build_caches_surfaces_component_failure(tmp_path):
+    """A component that cannot be classified must raise out of build_caches, not
+    be swallowed by the classification thread pool.
+
+    #6954: a worker failure that fails to surface strands the process and, in a
+    multi-host gang, silently desyncs the survivors into a multi-minute collective
+    hang. build_caches classifies components concurrently, so this guards that a
+    worker exception still propagates to the caller.
+    """
+    data_path = tmp_path / "docs.jsonl"
+    with data_path.open("w") as f:
+        f.write(json.dumps({"input_ids": [1, 2, 3, 4]}) + "\n")
+
+    def component(cache_subdir: str) -> DatasetComponent:
+        return DatasetComponent(
+            source=UrlDatasetSourceConfig(train_urls=[str(data_path)], validation_urls=[]),
+            format=PrebuiltLmDatasetFormat(),
+            cache_dir=str(tmp_path / cache_subdir),
+        )
+
+    config = LmDataConfig(
+        components={"a": component("a"), "b": component("b"), "c": component("c")},
+        tokenizer="passthrough",
+        vocab_size=16,
+        auto_build_caches=False,  # a missing cache must raise, not build on the fly
+    )
+
+    with pytest.raises(FileNotFoundError):
+        config.build_caches("train")
 
 
 def test_prebuilt_cache_without_loss_weights(tmp_path):

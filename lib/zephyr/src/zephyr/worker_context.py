@@ -3,8 +3,6 @@
 
 """Worker-side execution context exposed to user task code."""
 
-from __future__ import annotations
-
 import enum
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -29,7 +27,7 @@ class CounterEntry:
     stage: str | None = None
     count: int = 1  # number of observations; used for rolling average via update_counter
 
-    def merge(self, other: CounterEntry) -> None:
+    def merge(self, other: "CounterEntry") -> None:
         """Fold *other* into this entry in-place using this entry's aggregation.
 
         ``other.count`` is respected for AVERAGE so that merging two accumulated
@@ -65,16 +63,12 @@ class CounterSnapshot:
     generation: int
 
     @staticmethod
-    def empty(generation: int = 0) -> CounterSnapshot:
+    def empty(generation: int = 0) -> "CounterSnapshot":
         return CounterSnapshot(counters={}, generation=generation)
 
 
 class WorkerContext(Protocol):
-    # Number of concurrent worker slots sharing this actor's RAM. Consumers
-    # (e.g. the scatter writer's memory budget) divide a per-actor byte budget
-    # by this, so it is part of the contract rather than an implementation
-    # detail of a particular WorkerContext.
-    num_workers: int
+    task_memory_bytes: int
 
     def get_shared(self, name: str) -> Any: ...
     def set_counter(self, name: str, value: int | float, stage: str | None = None) -> None: ...

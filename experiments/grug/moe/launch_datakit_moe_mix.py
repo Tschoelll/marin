@@ -11,17 +11,20 @@ normalized below and used as a two-stage schedule.
 import math
 
 from fray.cluster import ResourceConfig
-from levanter.data.text import ConcatDatasetComponent, DatasetComponent, LmDataConfig, TextLmDatasetFormat
+from levanter.data.text.datasets import ConcatDatasetComponent, DatasetComponent, LmDataConfig, UrlDatasetSourceConfig
+from levanter.data.text.formats import TextLmDatasetFormat
 from levanter.tracker.wandb import WandbConfig
-from marin.execution.executor import executor_main
-from marin.execution.types import ExecutorStep, InputName, this_output_path, versioned
-from marin.processing.tokenize import add_validation_sets_to_mixture
+from marin.execution.lazy import ArtifactStep, StepContext
+from marin.execution.step_runner import StepRunner
+from marin.experiment.namespacing import user_namespaced_name
+from marin.training.training import LevanterCheckpoint
 
-from experiments.defaults import default_validation_sets
+from experiments.datasets.paloma import paloma_datasets
+from experiments.datasets.uncheatable import uncheatable_datasets
 from experiments.grug.moe.heuristic import build_from_heuristic
 from experiments.grug.moe.launch import GrugMoeLaunchConfig, run_grug_moe_trial
 from experiments.grug.moe.train import GrugEvalConfig, GrugTrainerConfig
-from experiments.marin_models import marin_tokenizer
+from experiments.marin_tokenizer import marin_tokenizer
 
 _STORE_PREFIX = "datakit/store_8ac06c74"
 # Large enough that the smallest nonzero CSV weights still receive at least
@@ -33,6 +36,9 @@ ENABLE_SIMULATED_EPOCHING = True
 # Natural size of ``datakit/store_8ac06c74`` from Will's datakit-moe-mix branch:
 # 167 mixable bucket caches plus the 33-cache tail component.
 _TARGET_BUDGET_TOKENS = 10_372_343_704_053
+
+# The datakit store lives in us-central2; pin training there to avoid cross-region I/O.
+_TRAIN_RESOURCES = ResourceConfig.with_tpu("v4-8", zone="us-central2-b")
 
 _BUCKET_PHASE_WEIGHTS: tuple[tuple[str, float, float], ...] = (
     ("c01q0", 0.022957, 0.031937),
@@ -251,11 +257,23 @@ def _bucket_path(bucket: str) -> str:
 def _bucket_component(bucket: str) -> DatasetComponent:
     return DatasetComponent(
         source=None,
-        cache_dir=InputName.hardcoded(_bucket_path(bucket)),
+        cache_dir=_bucket_path(bucket),
         format=TextLmDatasetFormat(),
         tags=[bucket],
         flat_cache=True,
     )
+
+
+def _val_component(cache_dir: str) -> DatasetComponent:
+    """Placeholder validation component from a cache dir path."""
+    source = UrlDatasetSourceConfig(
+        tags=[],
+        train_urls=[],
+        validation_urls=[],
+        cache_dir=cache_dir,
+        format=TextLmDatasetFormat(),
+    )
+    return DatasetComponent(source=source, cache_dir=source.cache_dir, format=source.format, tags=source.tags)
 
 
 def _normalize(weights: dict[str, float]) -> dict[str, float]:
@@ -300,9 +318,10 @@ def _datakit_data_config(
     batch_size: int,
     max_seq_len: int,
     enable_simulated_epoching: bool,
+    val_components: dict[str, DatasetComponent | ConcatDatasetComponent],
 ) -> LmDataConfig:
     phase_1_start = _phase_1_start_step(total_steps, batch_size)
-    budget_kwargs = {}
+    budget_kwargs: dict = {}
     if enable_simulated_epoching:
         experiment_budget = _simulated_experiment_budget(
             total_steps=total_steps,
@@ -316,19 +335,21 @@ def _datakit_data_config(
             "experiment_budget": experiment_budget,
         }
 
-    data = LmDataConfig(
+    all_components = {**_datakit_components(), **val_components}
+    val_zero_weights = {name: 0.0 for name in val_components}
+
+    return LmDataConfig(
         tokenizer=marin_tokenizer,
         cache_dir=None,
-        components=_datakit_components(),
+        components=all_components,
         train_weights=[
-            (0, _phase_weights(0)),
-            (phase_1_start, _phase_weights(1)),
+            (0, {**_phase_weights(0), **val_zero_weights}),
+            (phase_1_start, {**_phase_weights(1), **val_zero_weights}),
         ],
         auto_build_caches=False,
         mixture_block_size=_MIXTURE_BLOCK_SIZE,
         **budget_kwargs,
     )
-    return add_validation_sets_to_mixture(data, default_validation_sets(tokenizer=marin_tokenizer))
 
 
 _BUDGET: float = 2.19e17
@@ -342,53 +363,64 @@ _model, _optimizer, _batch_size, _steps = build_from_heuristic(
 
 _SLUG = f"d{_HIDDEN_DIM}-{_BUDGET:.2e}"
 
-datakit_moe_mix = ExecutorStep(
-    name=f"grug/datakit_moe_mix_{_SLUG}",
-    fn=run_grug_moe_trial,
-    config=GrugMoeLaunchConfig(
-        model=versioned(_model),
-        data=_datakit_data_config(
+_VALIDATION = [
+    *paloma_datasets(tokenizer=marin_tokenizer).values(),
+    *uncheatable_datasets(tokenizer=marin_tokenizer).values(),
+]
+
+
+def build(*, version: str = "dev") -> ArtifactStep[LevanterCheckpoint]:
+    """Grug MoE on the us-central2 datakit store with the mixture-3 two-phase bucket schedule."""
+
+    def build_config(ctx: StepContext) -> GrugMoeLaunchConfig:
+        if ctx.is_fingerprint:
+            val_components = {v.name: _val_component(ctx.artifact_path(v)) for v in _VALIDATION}
+        else:
+            val_components = {v.name: ctx.resolved(v).as_component() for v in _VALIDATION}
+        data = _datakit_data_config(
             total_steps=_steps,
             batch_size=_batch_size,
             max_seq_len=_model.max_seq_len,
             enable_simulated_epoching=ENABLE_SIMULATED_EPOCHING,
-        ),
-        output_path=this_output_path(),
-        run_id=f"datakit_moe_mix_{_SLUG}",
-        resources=versioned(ResourceConfig.with_tpu("v4-8", zone="us-central2-b", preemptible=False)),
-        steps=versioned(_steps),
-        batch_size=versioned(_batch_size),
-        seed=versioned(0),
-        mp=versioned("params=float32,compute=bfloat16,output=bfloat16"),
-        tracker=WandbConfig(
-            project="marin_moe",
-            tags=["moe", "datakit_store_mix", _SLUG],
-            group="datakit-moe-mix",
-            name=None,
-        ),
-        optimizer=versioned(_optimizer),
-        grug_trainer=versioned(
-            GrugTrainerConfig(
-                z_loss_weight=1e-4,
-                ema_beta=None,
-                log_every=1,
-            )
-        ),
-        eval=versioned(
-            GrugEvalConfig(
+            val_components=val_components,
+        )
+        return GrugMoeLaunchConfig(
+            model=_model,
+            data=data,
+            output_path=ctx.output_path,
+            run_id="datakit-moe-mix",
+            resources=ctx.runtime_arg("train_resources"),
+            steps=_steps,
+            batch_size=_batch_size,
+            seed=0,
+            mp="params=float32,compute=bfloat16,output=bfloat16",
+            tracker=WandbConfig(
+                project="marin_moe",
+                tags=["moe", "datakit_store_mix", _SLUG],
+                group="datakit-moe-mix",
+                name=None,
+            ),
+            optimizer=_optimizer,
+            grug_trainer=GrugTrainerConfig(z_loss_weight=1e-4, ema_beta=None, log_every=1),
+            eval=GrugEvalConfig(
                 eval_batch_size=512,
                 steps_per_eval=1000,
                 max_eval_batches=8,
                 eval_current=True,
                 eval_ema=False,
-            )
-        ),
-    ),
-)
+            ),
+        )
+
+    return ArtifactStep(
+        name=user_namespaced_name(f"grug/datakit_moe_mix_{_SLUG}", version),
+        version=version,
+        artifact_type=LevanterCheckpoint,
+        run=run_grug_moe_trial,
+        build_config=build_config,
+        deps=tuple(_VALIDATION),
+        runtime_args={"train_resources": _TRAIN_RESOURCES},
+    )
 
 
 if __name__ == "__main__":
-    executor_main(
-        steps=[datakit_moe_mix],
-        description="Grug MoE on the datakit us-central2 store with the mixture-3 two-phase bucket schedule.",
-    )
+    StepRunner().run([build().lower()])

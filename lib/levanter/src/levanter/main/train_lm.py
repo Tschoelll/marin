@@ -16,6 +16,9 @@ from haliax import Axis
 from haliax.partitioning import named_jit, round_axis_for_partitioning
 
 import levanter
+import levanter.analysis
+import levanter.config
+import levanter.tracker
 import levanter.callbacks
 import levanter.eval
 import levanter.eval_harness
@@ -26,11 +29,11 @@ from levanter.callbacks.tensorstore_callbacks import install_tensorstore_metrics
 from levanter.checkpoint import latest_checkpoint_path, load_checkpoint
 from levanter.compat.hf_checkpoints import HFCompatConfig, build_generation_config
 from levanter.data.mixture import MixtureDataset
-from levanter.data.text import LmDataConfig
+from levanter.data.text.datasets import LmDataConfig
 from levanter.eval_harness import LmEvalHarnessConfig
 from levanter.models.llama import LlamaConfig
 from levanter.models.lm_model import LmConfig, LmExample, LmHeadModel
-from levanter.optim import AdamConfig, OptimizerConfig
+from levanter.optim.config import AdamConfig, OptimizerConfig
 from levanter.trainer import Trainer, TrainerConfig
 from levanter.trainer_state import trainables_only
 from levanter.utils.jax_utils import parameter_count
@@ -140,8 +143,7 @@ def main(config: TrainLmConfig):
 
         assert isinstance(config.model, HFCompatConfig)
         converter = config.model.hf_checkpoint_converter()
-        if hasattr(tokenizer, "vocab") and tokenizer.vocab != converter.tokenizer.vocab:
-            logger.warning("The tokenizers appear to be different. You may want to check this.")
+        converter.warn_if_tokenizer_mismatch(tokenizer)
 
         if isinstance(config.initialize_from_hf, str):
             converter = converter.replaced(reference_checkpoint=config.initialize_from_hf, tokenizer=tokenizer)
@@ -163,7 +165,7 @@ def main(config: TrainLmConfig):
     else:
         converter = None
 
-    levanter.initialize(config)
+    levanter.trainer.initialize(config)
     optimizer = config.optimizer.build(config.trainer.num_train_steps)
 
     def loss_function(model: LmHeadModel, example: LmExample, *, key=None):
@@ -337,6 +339,12 @@ def main(config: TrainLmConfig):
         flops_per_example = 3 * flops_per_token * Pos.size if flops_per_token is not None else None
         trainer.add_hook(
             callbacks.log_performance_stats(Pos.size, trainer.config.batch_schedule, flops_per_example), every=1
+        )
+        trainer.add_hook(
+            callbacks.iris_status_reporter(
+                Pos.size, trainer.config.batch_schedule, trainer.config.num_train_steps, flops_per_example
+            ),
+            every=10,
         )
 
         if isinstance(train_dataset, MixtureDataset):

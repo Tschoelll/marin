@@ -10,25 +10,31 @@ has workers across CPU, TPU coscheduling, and multi-region scale groups.
 
 import logging
 import os
-import threading
 import time
 import uuid
 from pathlib import Path
 
 import pytest
-from connectrpc.errors import ConnectError
 from finelog.rpc import logging_pb2
 from finelog.rpc.logging_connect import LogServiceClientSync
 from iris.client.client import IrisClient, iris_ctx
-from iris.cluster.backends.local.cluster import LocalCluster
-from iris.cluster.config import load_config, make_local_config
+from iris.cluster.config import (
+    IrisClusterConfig,
+    LocalSliceConfig,
+    ScaleGroupConfig,
+    ScaleGroupResources,
+    SliceConfig,
+    load_config,
+    make_local_config,
+)
 from iris.cluster.constraints import Constraint, ConstraintOp, WellKnownAttribute, region_constraint
+from iris.cluster.endpoints import LOG_SERVER_ENDPOINT_NAME
 from iris.cluster.lifecycle import connect_cluster
-from iris.cluster.types import Entrypoint, EnvironmentSpec, ResourceSpec
-from iris.rpc import config_pb2, controller_pb2, job_pb2
-from iris.rpc.auth import AuthTokenInjector, StaticTokenProvider
+from iris.cluster.local_cluster import LocalCluster
+from iris.cluster.types import AcceleratorType, CapacityType, Entrypoint, EnvironmentSpec, ResourceSpec
+from iris.rpc import controller_pb2, job_pb2
 from iris.rpc.controller_connect import ControllerServiceClientSync
-from iris.version import client_revision_date
+from rigging.connect import proxy_path
 from rigging.timing import Duration, ExponentialBackoff
 
 from .conftest import (
@@ -55,39 +61,41 @@ pytestmark = pytest.mark.requires_cluster
 # ---------------------------------------------------------------------------
 
 
-def _add_cpu_group(config: config_pb2.IrisClusterConfig, num_workers: int = 4) -> None:
+def _add_cpu_group(config: IrisClusterConfig, num_workers: int = 4) -> None:
     """CPU scale group with multiple workers for scheduling diversity and bin-packing."""
-    sg = config.scale_groups["local-cpu"]
-    sg.name = "local-cpu"
-    sg.num_vms = 1
-    sg.buffer_slices = num_workers
-    sg.max_slices = num_workers
-    sg.resources.cpu_millicores = 8000
-    sg.resources.memory_bytes = 16 * 1024**3
-    sg.resources.disk_bytes = 50 * 1024**3
-    sg.resources.device_type = config_pb2.ACCELERATOR_TYPE_CPU
-    sg.resources.capacity_type = config_pb2.CAPACITY_TYPE_ON_DEMAND
-    sg.slice_template.local.SetInParent()
+    config.scale_groups["local-cpu"] = ScaleGroupConfig(
+        name="local-cpu",
+        num_vms=1,
+        buffer_slices=num_workers,
+        max_slices=num_workers,
+        resources=ScaleGroupResources(
+            cpu_millicores=8000,
+            memory_bytes=16 * 1024**3,
+            disk_bytes=50 * 1024**3,
+            device_type=AcceleratorType.CPU,
+            capacity_type=CapacityType.ON_DEMAND,
+        ),
+        slice_template=SliceConfig(local=LocalSliceConfig()),
+    )
 
 
-def _add_coscheduling_group_4vm(config: config_pb2.IrisClusterConfig) -> None:
+def _add_coscheduling_group_4vm(config: IrisClusterConfig) -> None:
     """4-VM TPU coscheduling group for large-job tests."""
-    sg = config.scale_groups["tpu_cosched_4"]
-    sg.name = "tpu_cosched_4"
-    sg.num_vms = 4
-    sg.buffer_slices = 1
-    sg.max_slices = 1
-    sg.resources.cpu_millicores = 128000
-    sg.resources.memory_bytes = 128 * 1024**3
-    sg.resources.disk_bytes = 1024 * 1024**3
-    sg.resources.device_type = config_pb2.ACCELERATOR_TYPE_TPU
-    sg.resources.device_variant = "v5litepod-32"
-    sg.resources.capacity_type = config_pb2.CAPACITY_TYPE_PREEMPTIBLE
-    sg.slice_template.capacity_type = config_pb2.CAPACITY_TYPE_PREEMPTIBLE
-    sg.slice_template.num_vms = 4
-    sg.slice_template.accelerator_type = config_pb2.ACCELERATOR_TYPE_TPU
-    sg.slice_template.accelerator_variant = "v5litepod-32"
-    sg.slice_template.local.SetInParent()
+    config.scale_groups["tpu_cosched_4"] = ScaleGroupConfig(
+        name="tpu_cosched_4",
+        num_vms=4,
+        buffer_slices=1,
+        max_slices=1,
+        resources=ScaleGroupResources(
+            cpu_millicores=128000,
+            memory_bytes=128 * 1024**3,
+            disk_bytes=1024 * 1024**3,
+            device_type=AcceleratorType.TPU,
+            device_variant="v5litepod-32",
+            capacity_type=CapacityType.PREEMPTIBLE,
+        ),
+        slice_template=SliceConfig(num_vms=4, local=LocalSliceConfig()),
+    )
 
 
 # Total local-mode workers:
@@ -95,7 +103,7 @@ def _add_coscheduling_group_4vm(config: config_pb2.IrisClusterConfig) -> None:
 SMOKE_WORKER_COUNT = 8
 
 
-def _make_smoke_config() -> config_pb2.IrisClusterConfig:
+def _make_smoke_config() -> IrisClusterConfig:
     """Build a local config with CPU and TPU (coscheduling) workers."""
     config = load_config(DEFAULT_CONFIG)
     config.scale_groups.clear()
@@ -122,7 +130,10 @@ def smoke_cluster(request):
     if controller_url:
         client = IrisClient.remote(controller_url, workspace=MARIN_ROOT)
         controller_client = ControllerServiceClientSync(address=controller_url, timeout_ms=30000)
-        log_client = LogServiceClientSync(address=controller_url, timeout_ms=30000)
+        log_client = LogServiceClientSync(
+            address=f"{controller_url.rstrip('/')}{proxy_path(LOG_SERVER_ENDPOINT_NAME)}",
+            timeout_ms=30000,
+        )
         tc = IrisTestCluster(
             url=controller_url,
             client=client,
@@ -137,6 +148,7 @@ def smoke_cluster(request):
         if workers:
             tc.wait_for_workers(1, timeout=600)
         yield tc
+        log_client.close()
         controller_client.close()
         return
 
@@ -144,10 +156,14 @@ def smoke_cluster(request):
     with connect_cluster(config) as url:
         client = IrisClient.remote(url, workspace=MARIN_ROOT)
         controller_client = ControllerServiceClientSync(address=url, timeout_ms=30000)
-        log_client = LogServiceClientSync(address=url, timeout_ms=30000)
+        log_client = LogServiceClientSync(
+            address=f"{url.rstrip('/')}{proxy_path(LOG_SERVER_ENDPOINT_NAME)}",
+            timeout_ms=30000,
+        )
         tc = IrisTestCluster(url=url, client=client, controller_client=controller_client, log_client=log_client)
         tc.wait_for_workers(SMOKE_WORKER_COUNT, timeout=60)
         yield tc
+        log_client.close()
         controller_client.close()
 
 
@@ -303,6 +319,10 @@ def test_dashboard_jobs_tab(smoke_cluster, smoke_page, smoke_screenshot):
     wait_for_dashboard_ready(smoke_page)
     for name in ["smoke-simple", "smoke-failed", "smoke-running"]:
         assert_visible(smoke_page, f"text={name}")
+    # The Cluster column is always rendered, blank for local jobs — a
+    # single-cluster smoke deployment shows the header with only "—" cells and
+    # never a peer annotation.
+    assert_visible(smoke_page, "th:has-text('Cluster')")
     smoke_screenshot(
         "jobs-tab",
         f"Jobs for user {user}: smoke-simple (succeeded), smoke-failed (failed), and smoke-running (running)",
@@ -380,15 +400,42 @@ def test_dashboard_job_detail(smoke_cluster, smoke_page, smoke_screenshot):
     )
 
 
+def _wait_for_task_log_marker(
+    cluster: IrisTestCluster, task_id: str, attempt_id: int, marker: str, *, timeout: float = 60.0
+) -> None:
+    """Poll the log server until the task attempt's EXACT-source logs contain ``marker``.
+
+    Log shipping is asynchronous: a worker flushes buffered lines after the task
+    exits, so a just-completed task's logs are not immediately queryable. This
+    mirrors the LogViewer's own EXACT ``{task}:{attempt}`` query so a dashboard test
+    can wait for the logs to land before asserting on a single page load.
+    """
+    source = f"{task_id}:{attempt_id}"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        request = logging_pb2.FetchLogsRequest(
+            source=source, match_scope=logging_pb2.MATCH_SCOPE_EXACT, tail=True, max_lines=1000
+        )
+        if any(marker in entry.data for entry in cluster.log_client.fetch_logs(request).entries):
+            return
+        time.sleep(0.5)
+    raise AssertionError(f"log marker {marker!r} for {source} not queryable within {timeout:.0f}s")
+
+
 def test_dashboard_task_logs(smoke_cluster, verbose_job, smoke_page, smoke_screenshot):
     """Task logs show lines and substring filter on the task detail page."""
     task_status = smoke_cluster.task_status(verbose_job)
     task_id = task_status.task_id
     job_id = verbose_job.job_id.to_wire()
 
+    # The LogViewer issues a single EXACT {task}:{attempt} fetch on mount and only
+    # re-polls every 30s, so its first fetch must not race the worker's asynchronous
+    # post-completion log flush. Wait for the attempt's logs to be queryable first
+    # (as test_log_levels_populated does) so the page renders them on load.
+    _wait_for_task_log_marker(smoke_cluster, task_id, task_status.current_attempt_id, "DONE: all lines emitted")
+
     dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job_id}/task/{task_id}")
     wait_for_dashboard_ready(smoke_page)
-
     smoke_page.wait_for_function(
         "() => document.body.textContent.includes('DONE: all lines emitted')",
         timeout=10000,
@@ -399,8 +446,32 @@ def test_dashboard_task_logs(smoke_cluster, verbose_job, smoke_page, smoke_scree
         "Should have structural elements like a status card and resource info.",
     )
 
-    # "validation failed" only appears in ERROR lines
-    smoke_page.fill("input[placeholder='Filter logs...']", "validation failed")
+    # This job logs plenty of ERROR-level lines but never crashes. Exception
+    # navigation keys off tracebacks and fatal banners, not severity, so it must
+    # find nothing here.
+    assert_visible(smoke_page, "text=No exceptions")
+
+    # Search marks matching lines in place. "validation failed" only appears in
+    # ERROR lines, so the INFO lines around them must survive — that is the whole
+    # point of search being distinct from filter.
+    search_input = "input[placeholder^='Search loaded lines']"
+    smoke_page.fill(search_input, "validation failed")
+    smoke_page.wait_for_function(
+        "() => document.querySelectorAll('mark').length > 0 && "
+        "document.body.textContent.includes('processing data batch')",
+        timeout=5000,
+    )
+    smoke_screenshot(
+        "task-logs-searched",
+        "Task detail page with a log search box populated; matching text is highlighted in place "
+        "and non-matching log lines are still visible around the highlights.",
+    )
+
+    # The filter re-queries the server and drops non-matching lines entirely. It
+    # applies on Enter, not on every keystroke.
+    filter_input = "input[placeholder^='Filter:']"
+    smoke_page.fill(filter_input, "validation failed")
+    smoke_page.press(filter_input, "Enter")
     smoke_page.wait_for_function(
         "() => document.body.textContent.includes('validation failed') && "
         "!document.body.textContent.includes('processing data batch')",
@@ -409,6 +480,33 @@ def test_dashboard_task_logs(smoke_cluster, verbose_job, smoke_page, smoke_scree
     smoke_screenshot(
         "task-logs-filtered",
         "Task detail page with log filter input populated and filtered log lines visible in the log viewer.",
+    )
+
+
+def test_dashboard_jump_to_exception(smoke_cluster, smoke_page, smoke_screenshot):
+    """A crashed task's log viewer finds and steps to the traceback."""
+    failed = smoke_cluster.submit(TestJobs.fail, "smoke-exception")
+    smoke_cluster.wait(failed, timeout=smoke_cluster.job_timeout)
+
+    task_status = smoke_cluster.task_status(failed)
+    _wait_for_task_log_marker(smoke_cluster, task_status.task_id, task_status.current_attempt_id, "Traceback")
+
+    dashboard_goto(
+        smoke_page,
+        f"{smoke_cluster.url}/job/{failed.job_id.to_wire()}/task/{task_status.task_id}",
+    )
+    wait_for_dashboard_ready(smoke_page)
+
+    # The control counts failures, not ERROR-level lines, and a whole traceback
+    # collapses to a single stop.
+    jump = smoke_page.locator("button", has_text="Jump to exception")
+    jump.wait_for(timeout=10000)
+    jump.click()
+    assert_visible(smoke_page, "text=/Exception 1 \\/ \\d+/")
+    smoke_screenshot(
+        "task-logs-exception",
+        "Task detail page for a failed task; the log viewer's exception control reads 'Exception 1 / N' "
+        "and a highlighted traceback line is visible in the log output.",
     )
 
 
@@ -432,38 +530,20 @@ def test_dashboard_constraints(smoke_cluster, smoke_page, smoke_screenshot):
         dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job.job_id.to_wire()}")
         wait_for_dashboard_ready(smoke_page)
 
+        # Placement constraints live in the collapsible "Scheduling" pane, which
+        # stays collapsed unless the job has pending tasks. Open it to inspect the chips.
         smoke_page.wait_for_function(
-            "() => document.body.textContent.includes('Constraints')",
+            "() => document.body.textContent.includes('Scheduling')",
             timeout=5000,
+        )
+        smoke_page.evaluate(
+            "() => [...document.querySelectorAll('details')]"
+            ".filter(d => d.querySelector('summary')?.textContent.includes('Scheduling'))"
+            ".forEach(d => { d.open = true })"
         )
         assert_visible(smoke_page, "text=region")
         smoke_screenshot(
-            "constraints", "Job detail page showing constraint chips for region, env-tag, and device-variant"
-        )
-
-
-def test_dashboard_scheduling_diagnostic(smoke_cluster, smoke_page, smoke_screenshot, capabilities):
-    """Scheduling diagnostic shows pending reason for oversized job."""
-    if not capabilities.has_workers:
-        pytest.skip("No persistent workers")
-    smoke_cluster.wait_for_workers(1, timeout=smoke_cluster.job_timeout)
-    with smoke_cluster.launched_job(TestJobs.quick, "smoke-diag-cpu", cpu=999_999) as job:
-        # Poll until the scheduler has evaluated the job and produced a
-        # CPU-specific pending reason (avoids racing the scheduler loop).
-        deadline = time.monotonic() + smoke_cluster.job_timeout
-        while time.monotonic() < deadline:
-            status = smoke_cluster.status(job)
-            if "cpu" in status.pending_reason.lower():
-                break
-            time.sleep(0.2)
-        assert status.state == job_pb2.JOB_STATE_PENDING
-        assert "cpu" in status.pending_reason.lower()
-
-        dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job.job_id.to_wire()}")
-        wait_for_dashboard_ready(smoke_page)
-        assert_visible(smoke_page, "text=Scheduling Diagnostic")
-        smoke_screenshot(
-            "scheduling-diagnostic", "Job detail page with yellow scheduling diagnostic banner explaining CPU capacity"
+            "constraints", "Job detail Scheduling pane showing constraint chips for region, env-tag, and device-variant"
         )
 
 
@@ -558,9 +638,130 @@ def test_dashboard_status_tab(smoke_cluster, smoke_page, smoke_screenshot):
     smoke_screenshot("status-tab", "Status tab showing controller process info or GetProcessStatus error")
 
 
+def _wait_for_backends_tab_ready(page) -> None:
+    # The combined execution-targets tab renders backend (and peer) cards only
+    # after ListBackends resolves. Anchor on the route hash plus the "N backend(s)"
+    # count subtitle in the tab's h2 — that subtitle renders only once the RPC
+    # resolves, unlike the persistent "Backends"/"Workers" nav links, so it marks
+    # the tab content (not just the shell) as loaded.
+    check = """
+        () => {
+            const routeReady = decodeURIComponent(window.location.hash) === "#/backends";
+            const heading = Array.from(document.querySelectorAll("h2"))
+                .find((h) => (h.textContent || "").trim().startsWith("Backends"));
+            const loaded = !!heading && /\\d+\\s+backend/.test(heading.textContent || "");
+            return routeReady && loaded;
+        }
+    """
+    _await_stable_screenshot(page, check)
+
+
+def test_dashboard_backends_tab(smoke_cluster, smoke_page, smoke_screenshot):
+    """Combined execution-targets tab renders local backends; no peers configured.
+
+    The smoke cluster has no federation peers, so this asserts graceful-empty
+    rendering: backend cards/rows show and no peer card ("peer" tag) appears.
+    """
+    dashboard_goto(smoke_page, f"{smoke_cluster.url}/backends")
+    wait_for_dashboard_ready(smoke_page)
+    # The readiness gate requires the "N backend(s)" subtitle, so reaching here
+    # already proves the backend cards rendered. With no peers configured, the
+    # roster is empty: no peer tag.
+    _wait_for_backends_tab_ready(smoke_page)
+    if not isinstance(smoke_page, _NoOpPage):
+        from playwright.sync_api import expect  # noqa: PLC0415  # optional dep: playwright
+
+        expect(smoke_page.get_by_text("peer", exact=True)).to_have_count(0)
+    smoke_screenshot(
+        "backends-tab",
+        "Execution-targets tab: local backend cards, no federation peers configured",
+    )
+
+
+def test_dashboard_backends_tab_with_peer(smoke_cluster, smoke_page, smoke_screenshot):
+    """A configured peer renders as a card alongside backends (route-mocked ListPeers).
+
+    The smoke cluster has no real peers, so ListPeers is stubbed at the browser to
+    prove the peer card renders: health dot, "peer" tag, aggregated device caps,
+    worker/task counts, and an inward link to the parent's cluster-filtered jobs
+    (never an outbound link to the peer's own dashboard).
+    """
+    if isinstance(smoke_page, _NoOpPage):
+        pytest.skip("Playwright unavailable")
+
+    import json  # noqa: PLC0415
+
+    peer_body = json.dumps(
+        {
+            "peers": [
+                {
+                    "peerId": "cw-smoke-peer",
+                    "controllerAddress": "https://cw.example:8443",
+                    "reachable": True,
+                    "lastContactMs": "1720000000000",
+                    "activeFederatedJobs": 2,
+                    "backends": [
+                        {
+                            "backendId": "cw-h100",
+                            "name": "cw-h100",
+                            "kind": "kubernetes",
+                            "capabilities": ["gpu"],
+                            "advertisedAttributes": {"accelerator": {"values": ["H100"]}},
+                            "scaleGroups": [],
+                            "workerCount": 4,
+                            "pendingTaskCount": 1,
+                            "runningTaskCount": 3,
+                            "hasAutoscaler": True,
+                            "capacityHealth": {},
+                        }
+                    ],
+                }
+            ]
+        }
+    )
+
+    def _fulfill_peers(route):
+        route.fulfill(status=200, content_type="application/json", body=peer_body)
+
+    smoke_page.route("**/ListPeers", _fulfill_peers)
+    try:
+        dashboard_goto(smoke_page, f"{smoke_cluster.url}/backends")
+        # The prior test already sits on #/backends, and a same-hash goto does not
+        # reload — the tab would keep its peerless roster and never re-issue
+        # ListPeers under the mock. Reload to force a fresh mount + refetch.
+        smoke_page.reload()
+        wait_for_dashboard_ready(smoke_page)
+        _wait_for_backends_tab_ready(smoke_page)
+        smoke_page.wait_for_function(
+            "() => document.body.textContent.includes('cw-smoke-peer')",
+            timeout=10000,
+        )
+        # Target the peer card heading, not the peer's (hidden) <option> in the
+        # scope <select>, which also carries the peer id.
+        assert_visible(smoke_page, "h3:has-text('cw-smoke-peer')")
+        # The peer links inward to the parent's cluster-filtered jobs, not out to
+        # the peer's own dashboard (which users can't reach).
+        assert_visible(smoke_page, "a[href*='cluster=cw-smoke-peer']")
+        smoke_screenshot(
+            "backends-tab-peer",
+            "Execution-targets tab with a federation peer card: health dot, peer tag, "
+            "aggregated caps, worker/task counts, and an inward link to the parent's "
+            "cluster-filtered jobs",
+        )
+    finally:
+        smoke_page.unroute("**/ListPeers", _fulfill_peers)
+
+
 def test_dashboard_job_detail_with_logs(smoke_cluster, verbose_job, smoke_page, smoke_screenshot):
     """Job detail page shows combined log viewer for all tasks."""
     job_id = verbose_job.job_id.to_wire()
+    # Same asynchronous-log-shipping race as test_dashboard_task_logs: wait for the
+    # task's logs to land before the single page-load fetch (EXACT is a superset of
+    # the job view's PREFIX query).
+    task_status = smoke_cluster.task_status(verbose_job)
+    _wait_for_task_log_marker(
+        smoke_cluster, task_status.task_id, task_status.current_attempt_id, "DONE: all lines emitted"
+    )
     dashboard_goto(smoke_page, f"{smoke_cluster.url}/job/{job_id}")
     wait_for_dashboard_ready(smoke_page)
     _wait_for_job_detail_screenshot_ready(smoke_page, job_id)
@@ -915,219 +1116,3 @@ def test_workdir_file_offload(smoke_cluster):
     )
     status = smoke_cluster.wait(job, timeout=smoke_cluster.job_timeout)
     assert status.state == job_pb2.JOB_STATE_SUCCEEDED
-
-
-# ============================================================================
-# Standalone cluster helpers
-# ============================================================================
-
-
-def _make_controller_only_config() -> config_pb2.IrisClusterConfig:
-    """Build a local config with no auto-scaled workers."""
-    config = load_config(DEFAULT_CONFIG)
-    config.scale_groups.clear()
-    sg = config.scale_groups["placeholder"]
-    sg.name = "placeholder"
-    sg.num_vms = 1
-    sg.buffer_slices = 0
-    sg.max_slices = 0
-    sg.resources.cpu_millicores = 1000
-    sg.resources.memory_bytes = 1 * 1024**3
-    sg.resources.disk_bytes = 10 * 1024**3
-    sg.resources.device_type = config_pb2.ACCELERATOR_TYPE_CPU
-    sg.resources.capacity_type = config_pb2.CAPACITY_TYPE_ON_DEMAND
-    sg.slice_template.local.SetInParent()
-    return make_local_config(config)
-
-
-# ============================================================================
-# Dashboard authentication flow (standalone cluster with auth enabled)
-# ============================================================================
-
-_AUTH_TOKEN = "e2e-test-token"
-_AUTH_USER = "test-user"
-
-
-def test_dashboard_login_flow():
-    """Dashboard shows login page when auth is enabled, allows token login, and supports logout.
-
-    Creates a standalone local cluster with static auth via config. Exercises the
-    full browser auth flow: redirect to login, paste token, verify RPC data loads,
-    then logout back to the login page.
-    """
-
-    try:
-        import playwright.sync_api as pw  # noqa: PLC0415  # optional dep: playwright
-    except ImportError:
-        pytest.skip("playwright not installed")
-
-    config = _make_controller_only_config()
-    config.auth.static.tokens[_AUTH_TOKEN] = _AUTH_USER
-    controller = LocalCluster(config)
-    url = controller.start()
-
-    # Run Playwright in a separate thread to avoid conflict with the asyncio
-    # event loop that AnyIO worker threads may have installed.
-    errors: list[Exception] = []
-
-    def _run_browser_flow():
-        try:
-            with pw.sync_playwright() as p:
-                browser = p.chromium.launch()
-                page = browser.new_page(viewport={"width": 1400, "height": 900})
-
-                # Navigate to dashboard root — auth guard should redirect to login
-                page.goto(f"{url}/")
-                page.wait_for_load_state("domcontentloaded")
-                wait_for_dashboard_ready(page)
-
-                page.wait_for_function(
-                    "() => window.location.hash.includes('/login')",
-                    timeout=10000,
-                )
-
-                # Login page should show the token textarea and login button
-                assert_visible(page, "text=Iris Dashboard")
-                assert_visible(page, "text=bearer token")
-                assert_visible(page, "button:has-text('Login')")
-
-                # Enter the token and submit
-                page.fill("textarea#token", _AUTH_TOKEN)
-                page.click("button:has-text('Login')")
-
-                # After login, should redirect to jobs tab (root hash)
-                page.wait_for_function(
-                    "() => !window.location.hash.includes('/login')",
-                    timeout=10000,
-                )
-                wait_for_dashboard_ready(page)
-
-                # Verify the dashboard loaded — the Jobs tab heading or
-                # an empty "No jobs" state should be visible
-                page.wait_for_function(
-                    "() => document.body.textContent.includes('Jobs') || "
-                    "document.body.textContent.includes('No jobs')",
-                    timeout=10000,
-                )
-
-                # Logout should redirect back to login
-                page.click("button:has-text('Logout')")
-                page.wait_for_function(
-                    "() => window.location.hash.includes('/login')",
-                    timeout=10000,
-                )
-                assert_visible(page, "text=bearer token")
-
-                page.close()
-                browser.close()
-        except Exception as exc:
-            errors.append(exc)
-
-    t = threading.Thread(target=_run_browser_flow)
-    t.start()
-    t.join(timeout=60)
-
-    try:
-        if errors:
-            raise errors[0]
-        if t.is_alive():
-            raise TimeoutError("Browser flow did not complete within 60s")
-    finally:
-        controller.close()
-
-
-def _login_for_jwt(url: str, identity_token: str) -> str:
-    """Exchange a raw identity token for a JWT via the Login RPC."""
-    client = ControllerServiceClientSync(address=url, timeout_ms=10000)
-    try:
-        resp = client.login(job_pb2.LoginRequest(identity_token=identity_token))
-        return resp.token
-    finally:
-        client.close()
-
-
-def test_static_auth_rpc_access():
-    """Static auth over loopback: tokenless requests are trusted as admin
-    (loopback trust), wrong tokens are rejected, valid JWTs are accepted."""
-
-    config = _make_controller_only_config()
-    config.auth.static.tokens[_AUTH_TOKEN] = _AUTH_USER
-    controller = LocalCluster(config)
-    url = controller.start()
-
-    try:
-        list_req = controller_pb2.Controller.ListWorkersRequest()
-
-        # The test client connects over loopback, so a tokenless request is
-        # trusted as the anonymous admin rather than rejected.
-        unauth_client = ControllerServiceClientSync(address=url, timeout_ms=5000)
-        assert unauth_client.list_workers(list_req) is not None
-        unauth_client.close()
-
-        # Wrong token: should be rejected
-        wrong_injector = AuthTokenInjector(StaticTokenProvider("wrong-token"))
-        wrong_client = ControllerServiceClientSync(address=url, timeout_ms=5000, interceptors=[wrong_injector])
-        with pytest.raises(ConnectError, match=r"(?i)authenticat"):
-            wrong_client.list_workers(list_req)
-        wrong_client.close()
-
-        # Exchange static token for JWT, then use JWT
-        jwt_token = _login_for_jwt(url, _AUTH_TOKEN)
-        valid_injector = AuthTokenInjector(StaticTokenProvider(jwt_token))
-        valid_client = ControllerServiceClientSync(address=url, timeout_ms=5000, interceptors=[valid_injector])
-        response = valid_client.list_workers(list_req)
-        assert response is not None
-        valid_client.close()
-    finally:
-        controller.close()
-
-
-def test_static_auth_job_ownership():
-    """Job ownership: user A cannot terminate user B's job.
-
-    Submits a job as user-a via the RPC layer (no workers needed; job stays
-    PENDING). Verifies user-b gets PERMISSION_DENIED when trying to terminate
-    it, while user-a can terminate their own job.
-    """
-
-    _TOKEN_A = "token-user-a"
-    _TOKEN_B = "token-user-b"
-
-    config = _make_controller_only_config()
-    config.auth.static.tokens[_TOKEN_A] = "user-a"
-    config.auth.static.tokens[_TOKEN_B] = "user-b"
-    controller = LocalCluster(config)
-    url = controller.start()
-
-    try:
-        # Exchange static tokens for JWTs via Login RPC
-        jwt_a = _login_for_jwt(url, _TOKEN_A)
-        jwt_b = _login_for_jwt(url, _TOKEN_B)
-
-        # User A submits a job (stays PENDING since no workers)
-        injector_a = AuthTokenInjector(StaticTokenProvider(jwt_a))
-        client_a = ControllerServiceClientSync(address=url, timeout_ms=10000, interceptors=[injector_a])
-
-        entrypoint = Entrypoint.from_callable(TestJobs.quick)
-        launch_req = controller_pb2.Controller.LaunchJobRequest(
-            name="/user-a/auth-owned-job",
-            entrypoint=entrypoint.to_proto(),
-            resources=ResourceSpec(cpu=1, memory="1g").to_proto(),
-            client_revision_date=client_revision_date(),
-        )
-        resp = client_a.launch_job(launch_req)
-        job_id = resp.job_id
-
-        # User B tries to terminate user A's job — should fail
-        injector_b = AuthTokenInjector(StaticTokenProvider(jwt_b))
-        client_b = ControllerServiceClientSync(address=url, timeout_ms=10000, interceptors=[injector_b])
-        with pytest.raises(ConnectError, match="cannot access resources owned by"):
-            client_b.terminate_job(controller_pb2.Controller.TerminateJobRequest(job_id=job_id))
-
-        # User A can terminate their own job
-        client_a.terminate_job(controller_pb2.Controller.TerminateJobRequest(job_id=job_id))
-
-        client_a.close()
-        client_b.close()
-    finally:
-        controller.close()

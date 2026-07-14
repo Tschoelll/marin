@@ -11,8 +11,6 @@ The finelog Docker image is assumed to be public on GHCR; no Artifact Registry
 or `docker login` wiring is performed here.
 """
 
-from __future__ import annotations
-
 import re
 
 # Container/host conventions baked into the bootstrap.
@@ -104,7 +102,7 @@ sudo docker run -d --name {{ container_name }} \\
     --memory="${container_mem_mib}m" \\
     -e FINELOG_PORT={{ port }} \\
     -e FINELOG_REMOTE_DIR={{ remote_log_dir }} \\
-    -v {{ cache_dir }}:{{ cache_dir }} \\
+    {{ auth_env }}-v {{ cache_dir }}:{{ cache_dir }} \\
     {{ docker_image }}
 
 echo "[finelog-init] Container started; waiting for /health on port {{ port }}..."
@@ -131,17 +129,28 @@ exit 1
 """
 
 
-def render_bootstrap(image: str, port: int, remote_log_dir: str) -> str:
-    """Render the finelog bootstrap script."""
+def render_bootstrap(image: str, port: int, remote_log_dir: str, auth_policy: str) -> str:
+    """Render the finelog bootstrap script.
+
+    ``auth_policy`` is the ``FINELOG_AUTH_POLICY`` JSON (see
+    ``deploy.config.auth_policy_json``); empty leaves the server on its private
+    allow-localhost default, which on a remote VM admits nothing but an SSH
+    tunnel. It is passed single-quoted, so it must not contain a single quote
+    (the JSON never does — CIDR prefixes, cluster names, PEM public keys).
+    """
     if not image:
         raise ValueError("image is required")
     if port <= 0:
         raise ValueError("port must be > 0")
+    if "'" in auth_policy:
+        raise ValueError("auth_policy must not contain a single quote")
+    auth_env = f"-e FINELOG_AUTH_POLICY='{auth_policy}' " if auth_policy else ""
     return render_template(
         BOOTSTRAP_SCRIPT,
         docker_image=image,
         port=port,
         remote_log_dir=remote_log_dir,
+        auth_env=auth_env,
         cache_dir=CACHE_DIR,
         container_name=CONTAINER_NAME,
     )

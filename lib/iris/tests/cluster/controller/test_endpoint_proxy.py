@@ -9,8 +9,6 @@ round-trip: method, path suffix, query string, headers, and streaming
 bodies.
 """
 
-from __future__ import annotations
-
 import asyncio
 import socket
 import time
@@ -27,7 +25,9 @@ from iris.cluster.controller.endpoint_proxy import (
     EndpointProxy,
     _rewrite_location,
 )
+from iris.cluster.controller.endpoint_service import ResolvedEndpoint, proxy_name_to_endpoint_names
 from iris.cluster.dashboard_common import on_shutdown
+from iris.cluster.types import EndpointAccess
 from iris.managed_thread import ThreadContainer
 from rigging.timing import Duration, ExponentialBackoff
 from starlette.applications import Starlette
@@ -90,6 +90,14 @@ def _build_upstream_app(handle: UpstreamHandle) -> Starlette:
         await _record(request)
         return PlainTextResponse("upstream blew up", status_code=500)
 
+    async def unauthorized(request: Request) -> Response:
+        await _record(request)
+        return PlainTextResponse(
+            "finelog rejected the controller",
+            status_code=401,
+            headers={"www-authenticate": 'Bearer realm="upstream"'},
+        )
+
     async def slow(request: Request) -> Response:
         await _record(request)
         # Just-long-enough to outlast the proxy's 0.5s timeout. Keeping this
@@ -149,6 +157,7 @@ def _build_upstream_app(handle: UpstreamHandle) -> Starlette:
     routes = [
         Route("/echo", echo, methods=list(ALLOWED_METHODS)),
         Route("/500", upstream_500),
+        Route("/401", unauthorized),
         Route("/slow", slow),
         Route("/large", large),
         Route("/cookie", cookie_setter),
@@ -345,6 +354,26 @@ def test_upstream_5xx_passes_through(proxy: ProxyHandle) -> None:
         resp = client.get(f"{proxy.base_url}/proxy/{ENDPOINT_URL_NAME}/500")
     assert resp.status_code == 500
     assert resp.text == "upstream blew up"
+
+
+def test_upstream_401_translated_to_502(proxy: ProxyHandle) -> None:
+    """An upstream 401 must not reach the browser as a 401.
+
+    The dashboard treats any 401 as an iris auth challenge and pops its login
+    modal. A 401 from a proxied upstream (e.g. finelog refusing the controller)
+    is not a browser auth challenge — the browser never authenticated to the
+    upstream — so the proxy rewrites it to 502, folding the upstream body into
+    the error the client reads and dropping the upstream's challenge header.
+    """
+    with httpx.Client() as client:
+        resp = client.get(f"{proxy.base_url}/proxy/{ENDPOINT_URL_NAME}/401")
+    assert resp.status_code == 502
+    error = resp.json()["error"]
+    # Names the refusing upstream and carries its body, so the real cause is visible.
+    assert ENDPOINT_URL_NAME in error
+    assert "finelog rejected the controller" in error
+    # The upstream's challenge must not reach the client alongside the translated status.
+    assert "www-authenticate" not in {k.lower() for k in resp.headers}
 
 
 def test_upstream_connection_refused_returns_502(threads: ThreadContainer) -> None:
@@ -679,7 +708,29 @@ def test_extract_proxy_subdomain(host: str, expected: str | None) -> None:
     assert _extract_proxy_subdomain(host) == expected
 
 
-def _build_subdomain_app(proxy: EndpointProxy):
+class _DictEndpointService:
+    """Minimal endpoint_service for the subdomain middleware in tests.
+
+    Backs ``resolve_proxy_target`` with the same ``name -> address`` dict the
+    proxy resolves against, delegating the wire-name decode to production's
+    ``proxy_name_to_endpoint_names`` so it cannot drift. All endpoints resolve as
+    PRIVATE; the subdomain tests run with the default (auth-disabled) policy,
+    so the access mode does not gate — they exercise dispatch, not
+    authorization.
+    """
+
+    def __init__(self, endpoints: dict[str, str]):
+        self._endpoints = endpoints
+
+    def resolve_proxy_target(self, encoded_name: str) -> ResolvedEndpoint | None:
+        for name in proxy_name_to_endpoint_names(encoded_name):
+            address = self._endpoints.get(name)
+            if address is not None:
+                return ResolvedEndpoint(name=name, address=address, access=EndpointAccess.ENDPOINT_ACCESS_PRIVATE)
+        return None
+
+
+def _build_subdomain_app(proxy: EndpointProxy, endpoints: dict[str, str]):
     """Wrap an EndpointProxy with subdomain dispatch + a fall-through inner app.
 
     The inner app responds 418 to any request that the middleware does not
@@ -692,7 +743,7 @@ def _build_subdomain_app(proxy: EndpointProxy):
 
     inner = Starlette(routes=[Route("/{path:path}", _inner, methods=list(ALLOWED_METHODS))])
     inner.router.redirect_slashes = False
-    return _SubdomainProxyMiddleware(inner, endpoint_proxy=proxy)
+    return _SubdomainProxyMiddleware(inner, endpoint_proxy=proxy, endpoint_service=_DictEndpointService(endpoints))
 
 
 def _start_subdomain_proxy(
@@ -701,7 +752,7 @@ def _start_subdomain_proxy(
     endpoints: dict[str, str],
 ) -> str:
     ep_proxy = EndpointProxy(endpoints.get)
-    app = _build_subdomain_app(ep_proxy)
+    app = _build_subdomain_app(ep_proxy, endpoints)
     port = _free_port()
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error", log_config=None)
     server = uvicorn.Server(config)

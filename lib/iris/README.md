@@ -350,7 +350,7 @@ dashboard rendering, log levels, profiling, and constraint routing.
 uv run pytest lib/iris/tests/e2e/test_smoke.py -m requires_cluster -o "addopts=" -v
 
 # Cloud mode: start cluster via CLI, then run tests against it
-# iris --cluster=smoke-gcp cluster start-smoke --label-prefix my-test --url-file /tmp/url --wait-for-workers 1
+# iris --cluster=ci-gcp-smoke cluster start-smoke --label-prefix my-test --url-file /tmp/url --wait-for-workers 1
 uv run pytest lib/iris/tests/e2e/test_smoke.py -m requires_cluster --iris-controller-url "$(cat /tmp/url)" -o "addopts="
 
 # Cloud mode: connect to existing cluster
@@ -437,3 +437,4 @@ scale_groups:
 - [Task States](docs/task-states.md) - Task state machine and retry semantics
 - [Priority Bands](docs/priority-bands.md) - production, interactive, and batch scheduling priority
 - [CoreWeave](docs/coreweave.md) - CoreWeave GPU cluster quickstart and operator guide
+- [Federation](docs/federation.md) - how a job is routed to a peer cluster, and what travels with it
