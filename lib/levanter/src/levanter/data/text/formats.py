@@ -53,7 +53,6 @@ class SupervisedLmDatasetFormat(LmDatasetFormatBase):
 
     input_key: str = "input"
     target_key: str = "target"
-    pack: bool | int | Literal["pad"] | None = None
     slice_strategy: Literal["left", "right", "raise"] = "left"
 
     def build_preprocessor(

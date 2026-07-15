@@ -362,8 +362,6 @@ def _effective_pack(component: DatasetComponent) -> bool | int | Literal["pad"]:
     fmt = component.format
     if isinstance(fmt, TextLmDatasetFormat):
         return False
-    if isinstance(fmt, SupervisedLmDatasetFormat):
-        return False if fmt.pack is None else fmt.pack
     if isinstance(fmt, ChatLmDatasetFormat):
         return True if fmt.pack is None else fmt.pack
     return False

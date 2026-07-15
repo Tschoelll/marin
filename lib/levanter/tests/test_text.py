@@ -546,10 +546,10 @@ def test_supervised_text_right_slice_retains_target_tokens(tmp_path):
 
     component = DatasetComponent(
         source=UrlDatasetSourceConfig(train_urls=[str(data_path)]),
+        pack=True,
         format=SupervisedLmDatasetFormat(
             input_key="input",
             target_key="target",
-            pack=True,
             slice_strategy="right",
         ),
         cache_dir=str(tmp_path),

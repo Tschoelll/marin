@@ -21,7 +21,6 @@ import re
 import time
 from collections.abc import Sequence
 
-import draccus
 from datasets import load_dataset_builder
 from fray.types import ResourceConfig
 from levanter.data.text.datasets import (
@@ -99,20 +98,11 @@ class TokenizedCache(Artifact):
 
     @property
     def format(self) -> LmDatasetFormatBase:
-        """Decode the recorded dataset format, inferring legacy text and supervised formats."""
+        """The dataset format; marin's tokenized caches are text format (``text_key``)."""
         fmt = self._config.get("format")
-        if not isinstance(fmt, dict):
-            return TextLmDatasetFormat()
-
-        format_type = self._config.get("format_type")
-        if not isinstance(format_type, str):
-            if "input_key" in fmt and "target_key" in fmt:
-                format_type = "supervised"
-            elif "text_key" in fmt:
-                format_type = "text"
-            else:
-                raise ValueError(f"{self.path}: tokenized cache record has an untyped dataset format")
-        return draccus.decode(LmDatasetFormatBase, {**fmt, "type": format_type})
+        if isinstance(fmt, dict) and "text_key" in fmt:
+            return TextLmDatasetFormat(text_key=fmt["text_key"])
+        return TextLmDatasetFormat()
 
     @property
     def tags(self) -> list[str]:
@@ -158,9 +148,6 @@ class TokenizeConfigBase(abc.ABC):
     levanter_batch_size: int | None = None
     """Number of tokenized records to accumulate before flushing to disk. Defaults to 16384.
     Lower values reduce peak memory for datasets with large documents."""
-
-    format_type: str | None = None
-    """Registered Levanter dataset-format name persisted with tokenized artifacts."""
 
     @abc.abstractmethod
     def as_lm_dataset_source_config(

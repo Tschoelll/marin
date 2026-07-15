@@ -7,15 +7,16 @@ import gzip
 import io
 import json
 from contextlib import ExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TextIO, TypedDict
 
 import pyarrow.parquet as pq
+from levanter.data.text.datasets import DatasetComponent
 from levanter.data.text.formats import SupervisedLmDatasetFormat
 from marin.execution.artifact import Artifact
-from marin.execution.lazy import ArtifactStep
-from marin.experiment.data import dataset_main, hf_download, tokenized
-from marin.processing.tokenize.tokenize import TokenizedCache
+from marin.execution.lazy import ArtifactStep, StepContext
+from marin.experiment.data import dataset_main, hf_download
+from marin.processing.tokenize.tokenize import TokenizeConfig, TokenizedCache, tokenize
 from rigging.filesystem import StoragePath, prefix_join
 
 from experiments.llama import llama3_tokenizer
@@ -28,7 +29,7 @@ _FINAL_USER_ONLY = "final_user_only"
 MRCR_CONDITIONS = (_FULL_CONTEXT, _FINAL_USER_ONLY)
 
 
-class MrcrMessage(TypedDict):
+class _MrcrMessage(TypedDict):
     role: str
     content: str
 
@@ -41,7 +42,18 @@ class MrcrTransformConfig:
     output_path: str
 
 
-def _render_prompt(messages: list[MrcrMessage]) -> str:
+class MrcrTokenizedCache(TokenizedCache):
+    """MRCR cache consumed as packed, right-sliced supervised examples."""
+
+    @property
+    def format(self) -> SupervisedLmDatasetFormat:
+        return SupervisedLmDatasetFormat(slice_strategy="right")
+
+    def as_component(self) -> DatasetComponent:
+        return replace(super().as_component(), pack=True)
+
+
+def _render_prompt(messages: list[_MrcrMessage]) -> str:
     turns = "".join(f"{message['role'].capitalize()}: {message['content']}\n" for message in messages)
     return f"{turns}Assistant: "
 
@@ -77,7 +89,7 @@ def transform_mrcr(config: MrcrTransformConfig) -> None:
                 parquet = pq.ParquetFile(source)
                 for batch in parquet.iter_batches(batch_size=1, columns=["prompt", "answer", "n_needles"]):
                     row = batch.to_pylist()[0]
-                    messages: list[MrcrMessage] = json.loads(row["prompt"])
+                    messages: list[_MrcrMessage] = json.loads(row["prompt"])
                     answer = row["answer"]
                     needles = row["n_needles"]
                     prompts = {
@@ -104,6 +116,34 @@ def _mrcr_tags(needles: int, condition: str) -> tuple[str, ...]:
     )
 
 
+def _tokenized_mrcr(
+    *,
+    name: str,
+    tokenizer: str,
+    raw: ArtifactStep[Artifact],
+    glob: str,
+    tags: tuple[str, ...],
+) -> ArtifactStep[TokenizedCache]:
+    def build_config(ctx: StepContext) -> TokenizeConfig:
+        return TokenizeConfig(
+            train_paths=[],
+            validation_paths=[prefix_join(ctx.artifact_path(raw), glob)],
+            cache_path=ctx.output_path,
+            tokenizer=tokenizer,
+            format=SupervisedLmDatasetFormat(slice_strategy="right"),
+            tags=list(tags),
+        )
+
+    return ArtifactStep(
+        name=name,
+        version=_VERSION,
+        artifact_type=MrcrTokenizedCache,
+        run=tokenize,
+        build_config=build_config,
+        deps=(raw,),
+    )
+
+
 def mrcr_datasets(*, tokenizer: str = llama3_tokenizer) -> dict[str, ArtifactStep[TokenizedCache]]:
     """Return paired MRCR validation datasets keyed by needle count and condition."""
 
@@ -125,16 +165,12 @@ def mrcr_datasets(*, tokenizer: str = llama3_tokenizer) -> dict[str, ArtifactSte
         ),
         deps=(raw,),
     )
-    dataset_format = SupervisedLmDatasetFormat(pack=True, slice_strategy="right")
     return {
-        f"{needles}needle/{condition}": tokenized(
-            f"mrcr/{needles}needle/{condition}-llama3",
+        f"{needles}needle/{condition}": _tokenized_mrcr(
+            name=f"mrcr/{needles}needle/{condition}-llama3",
             tokenizer=tokenizer,
-            version=_VERSION,
             raw=processed,
             glob=f"{needles}needle/{condition}.jsonl.gz",
-            validation=True,
-            dataset_format=dataset_format,
             tags=_mrcr_tags(needles, condition),
         )
         for needles in MRCR_NEEDLE_COUNTS

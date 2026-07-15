@@ -6,8 +6,10 @@ import json
 
 import pyarrow as pa
 import pyarrow.parquet as pq
+from levanter.data.text.formats import SupervisedLmDatasetFormat
+from marin.execution.artifact import ArtifactRecord, write_record
 
-from experiments.datasets.mrcr import MrcrTransformConfig, transform_mrcr
+from experiments.datasets.mrcr import MrcrTokenizedCache, MrcrTransformConfig, transform_mrcr
 
 
 def test_transform_mrcr_builds_paired_prompts_with_identical_targets(tmp_path):
@@ -45,3 +47,18 @@ def test_transform_mrcr_builds_paired_prompts_with_identical_targets(tmp_path):
     assert full_context["input"].endswith(final_user_only["input"])
     assert final_user_only["input"] == "User: return the remembered answer\nAssistant: "
     assert full_context["target"] == final_user_only["target"] == "prefix-old answer"
+
+
+def test_mrcr_cache_uses_packed_right_sliced_supervised_examples(tmp_path):
+    write_record(
+        ArtifactRecord(
+            output_path=str(tmp_path),
+            config={"tokenizer": "passthrough", "tags": ["mrcr/full_context"]},
+        )
+    )
+
+    component = MrcrTokenizedCache.raw_load(str(tmp_path)).as_component()
+
+    assert component.format == SupervisedLmDatasetFormat(slice_strategy="right")
+    assert component.pack is True
+    assert component.tags == ["mrcr/full_context"]

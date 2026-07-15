@@ -1,15 +1,10 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
-import json
-
 import pytest
-from levanter.data.text.formats import SupervisedLmDatasetFormat
-from marin.execution.artifact import ArtifactRecord, write_record
-from marin.execution.fingerprint import canonical_json
 from marin.execution.lazy import materialized_config
 from marin.experiment.data import tokenized
-from marin.processing.tokenize.tokenize import HfTokenizeConfig, TokenizeConfig, TokenizedCache
+from marin.processing.tokenize.tokenize import HfTokenizeConfig, TokenizeConfig
 
 _PREFIX = "gs://prefix"
 _TOKENIZER = "gpt2"
@@ -35,36 +30,6 @@ def test_tokenized_validation_routes_to_validation_split():
     cfg = materialized_config(tokenized("c", source=path, tokenizer=_TOKENIZER, validation=True, version=_V), _PREFIX)
     assert cfg.train_paths == []
     assert cfg.validation_paths == [path]
-
-
-def test_tokenized_preserves_supervised_format_in_config_and_artifact(tmp_path):
-    dataset_format = SupervisedLmDatasetFormat(
-        input_key="prompt",
-        target_key="answer",
-        pack=True,
-        slice_strategy="right",
-    )
-    cfg = materialized_config(
-        tokenized(
-            "c",
-            source="gs://bucket/val.jsonl",
-            tokenizer=_TOKENIZER,
-            validation=True,
-            dataset_format=dataset_format,
-            version=_V,
-        ),
-        _PREFIX,
-    )
-    assert cfg.format == dataset_format
-    assert cfg.format_type == "supervised"
-
-    write_record(
-        ArtifactRecord(
-            output_path=str(tmp_path),
-            config=json.loads(canonical_json(cfg)),
-        )
-    )
-    assert TokenizedCache.raw_load(str(tmp_path)).as_component().format == dataset_format
 
 
 def test_tokenized_requires_exactly_one_raw_input():
