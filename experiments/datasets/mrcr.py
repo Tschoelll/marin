@@ -6,7 +6,6 @@
 import gzip
 import io
 import json
-import posixpath
 from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import TextIO
@@ -17,14 +16,16 @@ from marin.execution.artifact import Artifact
 from marin.execution.lazy import ArtifactStep
 from marin.experiment.data import dataset_main, hf_download, tokenized
 from marin.processing.tokenize.tokenize import TokenizedCache
-from rigging.filesystem import StoragePath
+from rigging.filesystem import StoragePath, prefix_join
 
 from experiments.llama import llama3_tokenizer
 
 _HF_REVISION = "f4c69fae7cf81f7ca26b9fee34b392a50f6b8a1d"
 _VERSION = "2026.07.14.1"
 MRCR_NEEDLE_COUNTS = (2, 4, 8)
-MRCR_CONDITIONS = ("full_context", "final_user_only")
+_FULL_CONTEXT = "full_context"
+_FINAL_USER_ONLY = "final_user_only"
+MRCR_CONDITIONS = (_FULL_CONTEXT, _FINAL_USER_ONLY)
 
 
 @dataclass(frozen=True)
@@ -49,12 +50,8 @@ def _writer(
 ) -> TextIO:
     key = (needles, condition)
     if key not in writers:
-        path = posixpath.join(
-            output_path,
-            f"{needles}needle",
-            f"{condition}.jsonl.gz",
-        )
-        StoragePath(posixpath.dirname(path)).mkdirs(exist_ok=True)
+        path = prefix_join(output_path, f"{needles}needle/{condition}.jsonl.gz")
+        StoragePath(path).parent.mkdirs(exist_ok=True)
         raw = stack.enter_context(StoragePath(path).open("wb"))
         compressed = stack.enter_context(gzip.GzipFile(fileobj=raw, mode="wb", mtime=0))
         writers[key] = stack.enter_context(io.TextIOWrapper(compressed, encoding="utf-8"))
@@ -64,7 +61,7 @@ def _writer(
 def transform_mrcr(config: MrcrTransformConfig) -> None:
     """Convert MRCR into full-context and final-user-only target pairs."""
 
-    input_files = sorted(str(path) for path in StoragePath(f"{config.input_path}/**/*.parquet").glob())
+    input_files = sorted(str(path) for path in StoragePath(prefix_join(config.input_path, "**/*.parquet")).glob())
     if not input_files:
         raise FileNotFoundError(f"No MRCR parquet files found under {config.input_path}")
 
@@ -79,8 +76,8 @@ def transform_mrcr(config: MrcrTransformConfig) -> None:
                     answer = row["answer"]
                     needles = row["n_needles"]
                     prompts = {
-                        "full_context": _render_prompt(messages),
-                        "final_user_only": _render_prompt(messages[-1:]),
+                        _FULL_CONTEXT: _render_prompt(messages),
+                        _FINAL_USER_ONLY: _render_prompt(messages[-1:]),
                     }
 
                     for condition, prompt in prompts.items():
