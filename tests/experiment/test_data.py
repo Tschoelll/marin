@@ -1,9 +1,12 @@
 # Copyright The Marin Authors
 # SPDX-License-Identifier: Apache-2.0
 
+import json
+
 import pytest
 from levanter.data.text.formats import SupervisedLmDatasetFormat
 from marin.execution.artifact import ArtifactRecord, write_record
+from marin.execution.fingerprint import canonical_json
 from marin.execution.lazy import materialized_config
 from marin.experiment.data import tokenized
 from marin.processing.tokenize.tokenize import HfTokenizeConfig, TokenizeConfig, TokenizedCache
@@ -53,19 +56,12 @@ def test_tokenized_preserves_supervised_format_in_config_and_artifact(tmp_path):
         _PREFIX,
     )
     assert cfg.format == dataset_format
+    assert cfg.format_type == "supervised"
 
     write_record(
         ArtifactRecord(
             output_path=str(tmp_path),
-            config={
-                "tokenizer": _TOKENIZER,
-                "format": {
-                    "input_key": "prompt",
-                    "target_key": "answer",
-                    "pack": True,
-                    "slice_strategy": "right",
-                },
-            },
+            config=json.loads(canonical_json(cfg)),
         )
     )
     assert TokenizedCache.raw_load(str(tmp_path)).as_component().format == dataset_format

@@ -166,6 +166,7 @@ def tokenized(
     if dataset_format is not None and text_key != "text":
         raise ValueError(f"{name}: text_key cannot be combined with dataset_format")
     fmt = dataset_format if dataset_format is not None else TextLmDatasetFormat(text_key=text_key)
+    format_type = LmDatasetFormatBase.get_choice_name(type(fmt))
 
     def build_config(ctx: StepContext) -> TokenizeConfigBase:
         if source is not None and _looks_like_hf_id(source):
@@ -174,6 +175,7 @@ def tokenized(
                 cache_path=ctx.output_path,
                 tokenizer=tokenizer,
                 format=fmt,
+                format_type=format_type,
                 sample_count=sample_count,
                 tags=[*tags],
             )
@@ -189,6 +191,7 @@ def tokenized(
             cache_path=ctx.output_path,
             tokenizer=tokenizer,
             format=fmt,
+            format_type=format_type,
             sample_count=sample_count,
             tags=[*tags],
         )
