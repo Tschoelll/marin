@@ -209,7 +209,7 @@ def grug_moe_baseline(*, version: str = "dev") -> ArtifactStep[LevanterCheckpoin
 
     Every component is a :class:`Dataset` handle, so the whole graph lowers via
     :func:`~marin.execution.lazy.lower`. Pinned components never re-tokenize; the
-    paloma/uncheatable suites are validation (weight 0).
+    Paloma, Uncheatable, and MRCR suites are validation (weight 0).
     """
     nem = nemotron_datasets(tokenizer=llama3_tokenizer)
     train = {nem[split]: weight for split, weight in _NEMOTRON_WEIGHTS.items()}
