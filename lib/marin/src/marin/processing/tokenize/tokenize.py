@@ -99,7 +99,7 @@ class TokenizedCache(Artifact):
 
     @property
     def format(self) -> LmDatasetFormatBase:
-        """Decode the recorded dataset format, defaulting legacy untyped caches to text."""
+        """Decode the recorded dataset format, inferring legacy text and supervised formats."""
         fmt = self._config.get("format")
         if not isinstance(fmt, dict):
             return TextLmDatasetFormat()

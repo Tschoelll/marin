@@ -8,7 +8,7 @@ import io
 import json
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import TextIO
+from typing import TextIO, TypedDict
 
 import pyarrow.parquet as pq
 from levanter.data.text.formats import SupervisedLmDatasetFormat
@@ -28,6 +28,11 @@ _FINAL_USER_ONLY = "final_user_only"
 MRCR_CONDITIONS = (_FULL_CONTEXT, _FINAL_USER_ONLY)
 
 
+class MrcrMessage(TypedDict):
+    role: str
+    content: str
+
+
 @dataclass(frozen=True)
 class MrcrTransformConfig:
     """Paths for converting MRCR parquet files to paired supervised records."""
@@ -36,7 +41,7 @@ class MrcrTransformConfig:
     output_path: str
 
 
-def _render_prompt(messages: list[dict[str, str]]) -> str:
+def _render_prompt(messages: list[MrcrMessage]) -> str:
     turns = "".join(f"{message['role'].capitalize()}: {message['content']}\n" for message in messages)
     return f"{turns}Assistant: "
 
@@ -72,7 +77,7 @@ def transform_mrcr(config: MrcrTransformConfig) -> None:
                 parquet = pq.ParquetFile(source)
                 for batch in parquet.iter_batches(batch_size=1, columns=["prompt", "answer", "n_needles"]):
                     row = batch.to_pylist()[0]
-                    messages = json.loads(row["prompt"])
+                    messages: list[MrcrMessage] = json.loads(row["prompt"])
                     answer = row["answer"]
                     needles = row["n_needles"]
                     prompts = {
